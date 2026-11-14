@@ -154,9 +154,7 @@ fun SendPanel(ac: Color, ar: Boolean, status: String, img: Bitmap?, ssid: String
       Text("⚡ Ultra Fast Mode", Modifier.weight(1f), fontWeight = FontWeight.Bold)
       Switch(fast, onFast)
     }
-    if (prog.connected) Text("✓ " + t("اتصل جهاز", "Receiver connected"), color = ac, fontWeight = FontWeight.Bold)
-    else Pulse(t("بيدور على مستقبلين…", "Searching for receivers…"), ac)
-    TransferBanner(ac, ar)
+    Pulse(t("بيدور على مستقبلين…", "Searching for receivers…"), ac)
   }
   if (edit) {
     var tmp by remember { mutableStateOf(name) }
