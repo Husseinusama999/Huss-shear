@@ -1,13 +1,24 @@
 package com.huss.shear
+import android.Manifest
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.net.wifi.WifiNetworkSpecifier
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -26,6 +37,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -55,6 +67,19 @@ class Srv(val items: List<Item>) : NanoHTTPD(8888) {
   }
 }
 
+var resv: WifiManager.LocalOnlyHotspotReservation? = null
+var netCb: ConnectivityManager.NetworkCallback? = null
+var server: Srv? = null
+
+fun stopAll(c: Context) {
+  try { server?.stop() } catch (e: Exception) {}
+  server = null
+  try { resv?.close() } catch (e: Exception) {}
+  resv = null
+  netCb?.let { try { c.getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } catch (e: Exception) {} }
+  netCb = null
+}
+
 fun itemOf(c: Context, u: Uri): Item {
   var n = "file"; var s = -1L
   c.contentResolver.query(u, null, null, null, null)?.use {
@@ -63,10 +88,13 @@ fun itemOf(c: Context, u: Uri): Item {
   return Item(n, s) { c.contentResolver.openInputStream(u)!! }
 }
 
-fun localIp(): String {
-  for (n in NetworkInterface.getNetworkInterfaces()) for (a in n.inetAddresses)
+fun hostIp(): String {
+  val all = NetworkInterface.getNetworkInterfaces().toList()
+  for (n in all) if (Regex("^(ap|swlan|wlan1|softap).*").matches(n.name))
+    for (a in n.inetAddresses) if (a is Inet4Address) return a.hostAddress!!
+  for (n in all) for (a in n.inetAddresses)
     if (!a.isLoopbackAddress && a is Inet4Address && a.isSiteLocalAddress) return a.hostAddress!!
-  return "0.0.0.0"
+  return "192.168.43.1"
 }
 
 fun qr(t: String): Bitmap {
@@ -76,23 +104,64 @@ fun qr(t: String): Bitmap {
   return b
 }
 
-fun receive(c: Context, base: String, say: (String) -> Unit) {
+fun startSend(c: Context, items: List<Item>, done: (Bitmap?, String) -> Unit) {
+  val wm = c.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+  try {
+    wm.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
+      override fun onStarted(r: WifiManager.LocalOnlyHotspotReservation) {
+        resv = r
+        val ssid: String; val pass: String
+        if (Build.VERSION.SDK_INT >= 30) { val k = r.softApConfiguration; ssid = k.ssid ?: ""; pass = k.passphrase ?: "" }
+        else { @Suppress("DEPRECATION") val k = r.wifiConfiguration!!; ssid = k.SSID.trim('"'); pass = k.preSharedKey.trim('"') }
+        Thread {
+          try {
+            Thread.sleep(800)
+            val s = Srv(items); s.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false); server = s
+            done(qr(JSONObject().put("s", ssid).put("p", pass).put("u", "http://${hostIp()}:8888/").toString()), "")
+          } catch (e: Exception) { done(null, e.message ?: "error") }
+        }.start()
+      }
+      override fun onFailed(reason: Int) { done(null, "hotspot $reason") }
+    }, Handler(Looper.getMainLooper()))
+  } catch (e: Exception) { done(null, e.message ?: "error") }
+}
+
+fun receive(c: Context, n: Network, base: String, say: (String) -> Unit) {
   Thread {
     try {
-      val b = if (base.endsWith("/")) base else "$base/"
-      val a = JSONArray(URL(b + "list").readText())
+      val a = JSONArray(String(n.openConnection(URL(base + "list")).getInputStream().readBytes()))
       for (i in 0 until a.length()) {
-        val name = a.getJSONObject(i).getString("n")
-        say("${i + 1}/${a.length()}  $name")
+        val o = a.getJSONObject(i); val name = o.getString("n"); val size = o.getLong("s")
         val v = ContentValues().apply {
           put(MediaStore.Downloads.DISPLAY_NAME, name); put(MediaStore.Downloads.RELATIVE_PATH, "Download/HussShear")
         }
         val u = c.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)!!
-        URL(b + "f/$i").openStream().use { ins -> c.contentResolver.openOutputStream(u)!!.use { ins.copyTo(it, 262144) } }
+        val ins = n.openConnection(URL(base + "f/$i")).getInputStream()
+        val out = c.contentResolver.openOutputStream(u)!!
+        val buf = ByteArray(262144); var tot = 0L; var k = ins.read(buf)
+        while (k > 0) {
+          out.write(buf, 0, k); tot += k
+          if (size > 0) say("${i + 1}/${a.length()}  $name  ${tot * 100 / size}%")
+          k = ins.read(buf)
+        }
+        out.close(); ins.close()
       }
       say("✓ Download/HussShear")
     } catch (e: Exception) { say("✗ ${e.message}") }
   }.start()
+}
+
+fun join(c: Context, j: JSONObject, say: (String) -> Unit) {
+  val cm = c.getSystemService(ConnectivityManager::class.java)
+  val sp = WifiNetworkSpecifier.Builder().setSsid(j.getString("s")).setWpa2Passphrase(j.getString("p")).build()
+  val rq = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+    .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).setNetworkSpecifier(sp).build()
+  val cb = object : ConnectivityManager.NetworkCallback() {
+    override fun onAvailable(n: Network) { receive(c, n, j.getString("u"), say) }
+    override fun onUnavailable() { say("✗ تعذر الاتصال / Connection failed") }
+  }
+  netCb = cb
+  cm.requestNetwork(rq, cb, 40000)
 }
 
 class MainActivity : ComponentActivity() {
@@ -100,20 +169,42 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
+fun Circle(sym: String, label: String, ac: Color, onClick: () -> Unit) {
+  Column(horizontalAlignment = Alignment.CenterHorizontally) {
+    Box(Modifier.size(96.dp).clip(CircleShape).background(ac).clickable(onClick = onClick), contentAlignment = Alignment.Center) {
+      Text(sym, color = Color.White, fontSize = 44.sp, fontWeight = FontWeight.Black)
+    }
+    Spacer(Modifier.height(8.dp)); Text(label, fontWeight = FontWeight.Bold)
+  }
+}
+
+@Composable
 fun App() {
   val ctx = LocalContext.current
   var ar by remember { mutableStateOf(true) }
   var ac by remember { mutableStateOf(Color(0xFF7C5CFF)) }
+  var screen by remember { mutableStateOf("home") }
   var items by remember { mutableStateOf(listOf<Item>()) }
   var img by remember { mutableStateOf<Bitmap?>(null) }
-  var url by remember { mutableStateOf("") }
   var status by remember { mutableStateOf("") }
-  var inp by remember { mutableStateOf("") }
   var showApps by remember { mutableStateOf(false) }
-  var srv by remember { mutableStateOf<Srv?>(null) }
   fun t(a: String, e: String) = if (ar) a else e
+  fun begin() {
+    screen = "send"; img = null; status = t("جاري تجهيز الاتصال…", "Preparing connection…")
+    stopAll(ctx)
+    startSend(ctx, items.toList()) { b, e -> img = b; status = if (b != null) t("امسح الكود من الجهاز التاني", "Scan this code on the other device") else "✗ $e" }
+  }
+  val perm = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r ->
+    if (r.values.all { it }) begin() else status = t("لازم تسمح بالأذونات (الموقع)", "Please allow the permissions (location)")
+  }
   val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { us -> items = items + us.map { itemOf(ctx, it) } }
-  val scan = rememberLauncherForActivityResult(ScanContract()) { r -> r.contents?.let { inp = it; receive(ctx, it) { s -> status = s } } }
+  val scan = rememberLauncherForActivityResult(ScanContract()) { r ->
+    r.contents?.let {
+      try { val j = JSONObject(it); screen = "recv"; status = t("جاري الاتصال… وافق على نافذة الاتصال", "Connecting… accept the connect prompt"); join(ctx, j) { s -> status = s } }
+      catch (e: Exception) { status = "✗ QR" }
+    }
+  }
+  BackHandler(enabled = screen != "home") { stopAll(ctx); items = listOf(); img = null; screen = "home" }
   val pm = ctx.packageManager
   val apps = remember {
     pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
@@ -123,43 +214,44 @@ fun App() {
   CompositionLocalProvider(LocalLayoutDirection provides if (ar) LayoutDirection.Rtl else LayoutDirection.Ltr) {
     MaterialTheme(colorScheme = if (dark) darkColorScheme(primary = ac) else lightColorScheme(primary = ac)) {
       Surface(Modifier.fillMaxSize()) {
-        Column(Modifier.statusBarsPadding().padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.statusBarsPadding().padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
           Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(52.dp).clip(RoundedCornerShape(16.dp)).background(ac)) {
-              Image(painterResource(R.drawable.logo), null, Modifier.fillMaxSize().scale(1.5f))
-            }
+            Box(Modifier.size(48.dp).clip(RoundedCornerShape(15.dp)).background(ac)) { Image(painterResource(R.drawable.logo), null, Modifier.fillMaxSize().scale(1.5f)) }
             Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-              Text("Huss Shear", fontSize = 22.sp, fontWeight = FontWeight.Black)
-              Text(t("شارك أي حاجة بسرعة وبدون إنترنت", "Share anything fast, offline"), fontSize = 12.sp)
-            }
+            Text("Huss Shear", Modifier.weight(1f), fontSize = 22.sp, fontWeight = FontWeight.Black)
             TextButton(onClick = { ar = !ar }) { Text(if (ar) "EN" else "ع") }
           }
-          Text(t("إرسال", "Send"), fontSize = 18.sp, fontWeight = FontWeight.Bold)
-          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button({ pick.launch(arrayOf("*/*")) }) { Text(t("ملفات / صور / فيديو", "Files / photos / video")) }
-            OutlinedButton({ showApps = true }) { Text(t("تطبيقات", "Apps")) }
-          }
-          if (items.isNotEmpty()) Text(t("${items.size} ملف جاهز", "${items.size} item(s) ready") + ": " + items.joinToString { it.name })
-          Button({
-            srv?.stop(); val s = Srv(items.toList()); srv = s
-            Thread { try { s.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false) } catch (e: Exception) { status = "✗ ${e.message}" } }.start()
-            url = "http://${localIp()}:8888/"; img = qr(url)
-          }, enabled = items.isNotEmpty()) { Text(t("ابدأ الإرسال (QR)", "Start sending (QR)")) }
-          img?.let { Image(it.asImageBitmap(), null, Modifier.size(240.dp).align(Alignment.CenterHorizontally)); Text(url, Modifier.align(Alignment.CenterHorizontally)) }
-          Text(t("استقبال", "Receive"), fontSize = 18.sp, fontWeight = FontWeight.Bold)
-          OutlinedTextField(inp, { inp = it }, Modifier.fillMaxWidth(), label = { Text(t("عنوان المُرسِل", "Sender address")) }, singleLine = true)
-          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button({ scan.launch(ScanOptions().setBeepEnabled(false).setOrientationLocked(false)) }) { Text(t("امسح QR", "Scan QR")) }
-            OutlinedButton({ receive(ctx, inp) { status = it } }, enabled = inp.isNotBlank()) { Text(t("اتصل", "Connect")) }
-          }
-          Text(status)
-          Text(t("لون التطبيق", "App color"), fontWeight = FontWeight.Bold)
-          Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            listOf(0xFF7C5CFF, 0xFFFF5CA8, 0xFF00B8A9, 0xFFFF8A3D, 0xFF2F80ED, 0xFFE63946).forEach { c ->
-              Box(Modifier.size(36.dp).clip(CircleShape).background(Color(c)).clickable { ac = Color(c) })
+          if (screen == "home") {
+            Spacer(Modifier.height(30.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+              Circle("↑", t("إرسال", "Send"), ac) { items = listOf(); status = ""; screen = "pick" }
+              Circle("↓", t("استقبال", "Receive"), ac) { status = ""; scan.launch(ScanOptions().setBeepEnabled(false).setOrientationLocked(false)) }
+            }
+            Spacer(Modifier.height(30.dp))
+            if (status.isNotEmpty()) Text(status)
+            Text(t("لون التطبيق", "App color"), fontWeight = FontWeight.Bold)
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+              listOf(0xFF7C5CFF, 0xFFFF5CA8, 0xFF00B8A9, 0xFFFF8A3D, 0xFF2F80ED, 0xFFE63946).forEach { c ->
+                Box(Modifier.size(36.dp).clip(CircleShape).background(Color(c)).clickable { ac = Color(c) })
+              }
             }
           }
+          if (screen == "pick") {
+            Text(t("اختار اللي عايز تبعته", "Choose what to send"), fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+              Button({ pick.launch(arrayOf("*/*")) }) { Text(t("ملفات / صور / فيديو", "Files / photos / video")) }
+              OutlinedButton({ showApps = true }) { Text(t("تطبيقات", "Apps")) }
+            }
+            Text(t("${items.size} عنصر مختار", "${items.size} selected") + (if (items.isEmpty()) "" else ": " + items.joinToString { it.name }))
+            Button({
+              perm.launch(if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES) else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
+            }, Modifier.fillMaxWidth(), enabled = items.isNotEmpty()) { Text(t("التالي", "NEXT")) }
+          }
+          if (screen == "send") {
+            Text(status, Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+            img?.let { Image(it.asImageBitmap(), null, Modifier.size(280.dp).align(Alignment.CenterHorizontally)) }
+          }
+          if (screen == "recv") Text(status, Modifier.fillMaxWidth(), textAlign = TextAlign.Center, fontSize = 16.sp)
         }
         if (showApps) AlertDialog(onDismissRequest = { showApps = false }, confirmButton = { TextButton({ showApps = false }) { Text("OK") } },
           title = { Text(t("اختار تطبيقات", "Pick apps")) },
