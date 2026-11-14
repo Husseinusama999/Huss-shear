@@ -36,18 +36,6 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
 
-class Prog {
-  var done by mutableLongStateOf(0L); var total by mutableLongStateOf(0L); var t0 = 0L; var connected by mutableStateOf(false)
-  fun reset(t: Long) { done = 0L; total = t; t0 = System.currentTimeMillis(); connected = false }
-}
-val prog = Prog()
-
-class CountIn(val i: InputStream) : InputStream() {
-  override fun read(): Int { val b = i.read(); if (b >= 0) prog.done += 1; return b }
-  override fun read(b: ByteArray, o: Int, l: Int): Int { val n = i.read(b, o, l); if (n > 0) prog.done += n; return n }
-  override fun close() = i.close()
-}
-
 class Media(val uri: Uri, val name: String, val size: Long)
 
 fun loadMedia(c: Context, base: Uri): List<Media> {
@@ -77,39 +65,21 @@ fun Thumb(c: Context, m: Media, mod: Modifier) {
 }
 
 @Composable
-fun TransferBanner(ac: Color, ar: Boolean) {
-  if (prog.total <= 0) return
-  val el = ((System.currentTimeMillis() - prog.t0) / 1000.0).coerceAtLeast(1.0)
-  val sp = prog.done / el
-  val left = if (sp > 0) (prog.total - prog.done) / sp / 60 else 0.0
-  val frac = (prog.done.toFloat() / prog.total).coerceIn(0f, 1f)
-  Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(ac)) {
-    Box(Modifier.matchParentSize()) { Box(Modifier.fillMaxHeight().fillMaxWidth(frac).background(Color(0x40FFFFFF))) }
-    Row(Modifier.fillMaxWidth().padding(18.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-      Text("%.1f".format(prog.done / 1e6), color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Bold)
-      Text(if (ar) "ميجا\nمُرسَل" else "MB\nSent", color = Color.White)
-      Text("%.1f".format(left), color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Bold)
-      Text(if (ar) "دقيقة\nمتبقية" else "Min\nLeft", color = Color.White)
-    }
-  }
-}
-
-@Composable
 fun PickScreen(mod: Modifier, sel: List<Item>, onSel: (List<Item>) -> Unit, files: (Array<String>) -> Unit, folder: () -> Unit, apps: List<ApplicationInfo>,
-               pm: PackageManager, ac: Color, ar: Boolean, next: () -> Unit) {
+               pm: PackageManager, ac: Color, ar: Boolean, startTab: Int = 0, next: () -> Unit) {
   val c = LocalContext.current
   fun t(a: String, e: String) = if (ar) a else e
   val perms = if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.READ_MEDIA_AUDIO)
     else arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
   var ok by remember { mutableStateOf(perms.all { ContextCompat.checkSelfPermission(c, it) == PackageManager.PERMISSION_GRANTED }) }
   val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r -> ok = r.values.all { it } }
-  var tab by remember { mutableIntStateOf(0) }
+  var tab by remember { mutableIntStateOf(startTab) }
   val names = listOf(t("فيديوهات", "Videos"), t("صور", "Photos"), t("موسيقى", "Music"), t("تطبيقات", "Apps"), t("ملفات", "Files"), t("جهات الاتصال", "Contacts"))
   val lists = remember(ok) {
     if (ok) listOf(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI).map { loadMedia(c, it) } else listOf()
   }
-  fun toggle(k: String, n: String, s: Long, open: () -> InputStream) {
-    onSel(if (sel.any { it.key == k }) sel.filter { it.key != k } else sel + Item(n, s, k, open))
+  fun toggle(k: String, n: String, s: Long, icon: ByteArray? = null, open: () -> InputStream) {
+    onSel(if (sel.any { it.key == k }) sel.filter { it.key != k } else sel + Item(n, s, k, icon, open))
   }
   Column(mod) {
     ScrollableTabRow(selectedTabIndex = tab, edgePadding = 0.dp) { names.forEachIndexed { i, n -> Tab(tab == i, { tab = i }, text = { Text(n) }) } }
@@ -135,14 +105,16 @@ fun PickScreen(mod: Modifier, sel: List<Item>, onSel: (List<Item>) -> Unit, file
           }
         }
       }
-      else if (tab == 5) ContactsTab(sel, { k, n, s, o -> toggle(k, n, s, o) }, ac, ar)
+      else if (tab == 5) ContactsTab(sel, { k, n, s, o -> toggle(k, n, s, null, o) }, ac, ar)
       else if (tab < 3 && !ok) Column(Modifier.fillMaxSize(), Arrangement.Center, Alignment.CenterHorizontally) { Button({ ask.launch(perms) }) { Text(t("اسمح بالوصول للوسائط", "Allow media access")) } }
       else if (tab == 3) LazyVerticalGrid(GridCells.Fixed(4), Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         items(apps) { ai ->
           val label = remember(ai.packageName) { pm.getApplicationLabel(ai).toString() }
-          val icon = remember(ai.packageName) { pm.getApplicationIcon(ai).toBitmap(96, 96).asImageBitmap() }
+          val bm = remember(ai.packageName) { pm.getApplicationIcon(ai).toBitmap(96, 96) }
+          val icon = remember(bm) { bm.asImageBitmap() }
+          val png = remember(bm) { java.io.ByteArrayOutputStream().also { bm.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }.toByteArray() }
           val k = "app:" + ai.packageName
-          Column(Modifier.clickable { toggle(k, "$label.apk", File(ai.sourceDir).length()) { FileInputStream(ai.sourceDir) } }, horizontalAlignment = Alignment.CenterHorizontally) {
+          Column(Modifier.clickable { toggle(k, "$label.apk", File(ai.sourceDir).length(), png) { FileInputStream(ai.sourceDir) } }, horizontalAlignment = Alignment.CenterHorizontally) {
             Box { Image(icon, null, Modifier.size(56.dp)); Check(sel.any { it.key == k }, ac, Modifier.align(Alignment.TopEnd)) }
             Text(label, fontSize = 11.sp, maxLines = 1)
           }
