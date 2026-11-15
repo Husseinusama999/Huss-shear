@@ -16,7 +16,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yausername.ffmpeg.FFmpeg
-import com.yausername.youtubedl_android.DownloadProgressCallback
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
 import java.io.File
@@ -47,12 +46,12 @@ fun withCover(mp3: File, img: ByteArray) {
   mp3.writeBytes(hdr + frame + old.copyOfRange(off, old.size))
 }
 
-fun ytRun(rq: YoutubeDLRequest, onP: (Float) -> Unit) { YoutubeDL.getInstance().execute(rq, "huss", DownloadProgressCallback { p, _, _ -> onP(p) }) }
+fun ytRun(rq: YoutubeDLRequest, onP: (Float) -> Unit) { YoutubeDL.getInstance().execute(rq, "huss", { p, _, _ -> onP(p) }) }
 
 fun runJob(rq: YoutubeDLRequest, dir: File, cover: ByteArray?, onP: (Float) -> Unit, done: (String) -> Unit) {
   Thread {
     try {
-      YoutubeDL.getInstance().execute(rq, "huss", DownloadProgressCallback { p, _, _ -> onP(p) })
+      YoutubeDL.getInstance().execute(rq, "huss", { p, _, _ -> onP(p) })
       val outs = (dir.walkTopDown().filter { it.isFile && !it.name.startsWith("in_") && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }).toList()
       if (cover != null) outs.filter { it.extension == "mp3" }.forEach { withCover(it, cover) }
       outs.forEach { exportFile(it) }
