@@ -48,6 +48,49 @@ fun withCover(mp3: File, img: ByteArray) {
 
 fun ytRun(rq: YoutubeDLRequest, onP: (Float) -> Unit) { YoutubeDL.getInstance().execute(rq, "huss", { p, _, _ -> onP(p) }) }
 
+fun runFfmpeg(args: List<String>): Pair<Int, String> {
+  val bin = File(appCtx.applicationInfo.nativeLibraryDir, "libffmpeg.so")
+  if (!bin.exists()) return 127 to "ffmpeg binary not found: ${bin.absolutePath}"
+  val libs = File(appCtx.noBackupFilesDir, "youtubedl-android/packages/ffmpeg/usr/lib")
+  val pb = ProcessBuilder(listOf(bin.absolutePath, "-hide_banner", "-nostats") + args).redirectErrorStream(true)
+  pb.environment()["LD_LIBRARY_PATH"] = libs.absolutePath
+  val p = pb.start(); val out = p.inputStream.bufferedReader().readText()
+  return p.waitFor() to out
+}
+
+fun linkJob(url: String, opt: String, br: Int, dir: File, onP: (Float) -> Unit, done: (String) -> Unit) {
+  Thread {
+    try {
+      val audio = opt == "MP3" || opt == "M4A"
+      val rq = YoutubeDLRequest(url).addOption("--no-playlist").addOption("-o", dir.absolutePath + "/%(title).80s.%(ext)s")
+      if (audio) rq.addOption("-f", "ba/b")
+      else { val h = opt.removeSuffix("p"); rq.addOption("-f", "bv*[height<=$h]+ba/b[height<=$h]/b"); rq.addOption("--merge-output-format", "mp4") }
+      var err: String? = null
+      try { ytRun(rq, onP) } catch (e: Throwable) { err = e.message }
+      val outs = ArrayList<File>()
+      val files = dir.listFiles()?.filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") } ?: listOf()
+      if (audio) {
+        val src = files.maxByOrNull { it.length() } ?: throw Exception(err ?: "no file")
+        val out = File(dir, src.nameWithoutExtension + "." + opt.lowercase())
+        val r = runFfmpeg(listOf("-y", "-i", src.absolutePath, "-vn", "-c:a", if (opt == "MP3") "libmp3lame" else "aac", "-b:a", "${br}k", out.absolutePath))
+        if (r.first != 0) throw Exception(r.second.takeLast(300))
+        outs.add(out)
+      } else {
+        val frag = files.filter { Regex("\\.f\\d+\\.").containsMatchIn(it.name) }.sortedByDescending { it.length() }
+        if (frag.size >= 2) {
+          val out = File(dir, frag[0].name.replace(Regex("\\.f\\d+\\."), ".").substringBeforeLast('.') + ".mp4")
+          val r = runFfmpeg(listOf("-y", "-i", frag[0].absolutePath, "-i", frag[1].absolutePath, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", out.absolutePath))
+          if (r.first != 0) throw Exception(r.second.takeLast(300))
+          outs.add(out)
+        } else if (files.isNotEmpty() && err == null) outs.addAll(files) else throw Exception(err ?: "no file")
+      }
+      outs.forEach { exportFile(it) }
+      done("✓ Download/HussShear: " + outs.joinToString { it.name })
+    } catch (e: Throwable) { done("✗ ${e.message}") }
+    dir.deleteRecursively()
+  }.start()
+}
+
 fun runJob(rq: YoutubeDLRequest, dir: File, cover: ByteArray?, onP: (Float) -> Unit, done: (String) -> Unit) {
   Thread {
     try {
@@ -110,10 +153,7 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
   Button({
     busy = true; pr = 0f; st = "…"
     val dir = tmp()
-    val rq = YoutubeDLRequest(url.trim()).addOption("--no-playlist").addOption("-o", dir.absolutePath + "/%(title).80s.%(ext)s")
-    if (opt == "MP3" || opt == "M4A") { rq.addOption("-x"); rq.addOption("--audio-format", opt.lowercase()); rq.addOption("--audio-quality", "${br}K") }
-    else { val h = opt.removeSuffix("p"); rq.addOption("-f", "bv*[height<=$h]+ba/b[height<=$h]"); rq.addOption("--merge-output-format", "mp4") }
-    runJob(rq, dir, null, { pr = it / 100f }) { finish(it) }
+    linkJob(url.trim(), opt, br, dir, { pr = it / 100f }) { finish(it) }
   }, Modifier.fillMaxWidth(), enabled = ok && url.isNotBlank()) { Text(t("نزّل", "Download")) }
   HorizontalDivider()
   Text(t("تحويل ملف لصوت", "Convert a file to audio"), fontSize = 18.sp, fontWeight = FontWeight.Bold)
@@ -131,7 +171,7 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
   if (fmt == "mp3") OutlinedButton({ pickC.launch("image/*") }) { Text(if (cover == null) t("صورة الغلاف (اختياري)", "Cover art (optional)") else t("تم اختيار الغلاف ✓", "Cover selected ✓")) }
   Button({
     val u = fileUri ?: return@Button
-    busy = true; pr = 0f; st = "…"
+    busy = true; pr = -1f; st = "…"
     val dir = tmp(); val outDir = File(dir, "out")
     val stem = fileName.substringBeforeLast('.').replace("/", "_").replace("%", "%%")
     val inF = File(dir, "in_" + System.currentTimeMillis() + "." + fileName.substringAfterLast('.', "bin"))
@@ -142,23 +182,25 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
         if (doIso && mode == "inst") af.add("pan=stereo|c0=c0-c1|c1=c1-c0")
         if (doIso && mode == "voc") af.add("pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1")
         if (doBoost && gain.toInt() != 100) { af.add("volume=" + String.format(Locale.US, "%.2f", gain / 100f)); af.add("alimiter=limit=0.97") }
-        var src = inF
-        if (af.isNotEmpty()) {
-          val w = File(dir, "w"); w.mkdirs()
-          val r1 = YoutubeDLRequest("file://" + inF.absolutePath).addOption("--enable-file-urls").addOption("--no-playlist")
-          r1.addOption("-x"); r1.addOption("--audio-format", "wav")
-          r1.addOption("--postprocessor-args", "ExtractAudio:-af " + af.joinToString(","))
-          r1.addOption("-o", w.absolutePath + "/in_p1.%(ext)s")
-          ytRun(r1) { pr = it / 200f }
-          src = w.listFiles()!!.first()
-        }
-        val rq = YoutubeDLRequest("file://" + src.absolutePath).addOption("--enable-file-urls").addOption("--no-playlist")
-        rq.addOption("-x"); rq.addOption("--audio-format", fmt); rq.addOption("--audio-quality", "${br}K")
-        rq.addOption("-o", outDir.absolutePath + "/" + stem + ".%(ext)s")
-        runJob(rq, dir, cover, { pr = 0.5f + it / 200f }) { finish(it) }
+        if (doIso) af.add(0, "aformat=channel_layouts=stereo")
+        outDir.mkdirs()
+        val outF = File(outDir, stem + "." + fmt)
+        val cv = cover?.let { File(dir, "cover.jpg").also { f -> f.writeBytes(it) } }
+        val a = ArrayList<String>(listOf("-y", "-i", inF.absolutePath))
+        if (cv != null) a.addAll(listOf("-i", cv.absolutePath))
+        a.addAll(listOf("-map", "0:a:0"))
+        if (cv != null) a.addAll(listOf("-map", "1:v:0"))
+        if (af.isNotEmpty()) a.addAll(listOf("-af", af.joinToString(",")))
+        a.addAll(listOf("-c:a", if (fmt == "mp3") "libmp3lame" else "aac", "-b:a", "${br}k"))
+        if (cv != null) { a.addAll(listOf("-c:v", "mjpeg", "-disposition:v:0", "attached_pic")); if (fmt == "mp3") a.addAll(listOf("-id3v2_version", "3")) }
+        a.add(outF.absolutePath)
+        val r = runFfmpeg(a)
+        if (r.first != 0 || !outF.exists()) finish("✗ " + r.second.takeLast(300))
+        else { exportFile(outF); finish("✓ Download/HussShear: " + outF.name) }
+        dir.deleteRecursively()
       } catch (e: Throwable) { finish("✗ ${e.message}"); dir.deleteRecursively() }
     }.start()
   }, Modifier.fillMaxWidth(), enabled = ok && fileUri != null && (doExtract || doBoost || doIso)) { Text(t("حوّل", "Convert")) }
-  if (busy) LinearProgressIndicator(progress = { pr }, Modifier.fillMaxWidth(), color = ac)
+  if (busy) { if (pr < 0f) LinearProgressIndicator(Modifier.fillMaxWidth(), color = ac) else LinearProgressIndicator(progress = { pr }, Modifier.fillMaxWidth(), color = ac) }
   if (st.isNotEmpty()) Text(st)
 }
