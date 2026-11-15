@@ -51,12 +51,15 @@ fun ytRun(rq: YoutubeDLRequest, onP: (Float) -> Unit) { YoutubeDL.getInstance().
 fun runFfmpeg(args: List<String>): Pair<Int, String> {
   val bin = File(appCtx.applicationInfo.nativeLibraryDir, "libffmpeg.so")
   if (!bin.exists()) return 127 to "ffmpeg binary not found: ${bin.absolutePath}"
-  val pk = File(appCtx.noBackupFilesDir, "youtubedl-android/packages")
-  val libs = listOf("python", "ffmpeg", "aria2c").map { File(pk, "$it/usr/lib").absolutePath } + appCtx.applicationInfo.nativeLibraryDir
+  val libs = ArrayList<String>()
+  for (r in listOf(appCtx.noBackupFilesDir, appCtx.filesDir, File(appCtx.applicationInfo.nativeLibraryDir), appCtx.codeCacheDir))
+    if (r.exists()) r.walkTopDown().maxDepth(9).forEach { if (it.isFile && it.name.endsWith(".so") && it.parentFile!!.absolutePath !in libs) libs.add(it.parentFile!!.absolutePath) }
+  val hasCpp = libs.any { File(it, "libc++_shared.so").exists() }
   val pb = ProcessBuilder(listOf(bin.absolutePath, "-hide_banner", "-nostats") + args).redirectErrorStream(true)
   pb.environment()["LD_LIBRARY_PATH"] = libs.joinToString(":")
   val p = pb.start(); val out = p.inputStream.bufferedReader().readText()
-  return p.waitFor() to out
+  val code = p.waitFor()
+  return code to (if (code != 0) out + "\n[c++ shared found: $hasCpp; lib dirs: ${libs.size}]" else out)
 }
 
 fun linkJob(url: String, opt: String, br: Int, dir: File, onP: (Float) -> Unit, done: (String) -> Unit) {
