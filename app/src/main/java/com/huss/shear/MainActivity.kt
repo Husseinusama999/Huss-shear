@@ -28,7 +28,7 @@ import androidx.compose.ui.unit.sp
 import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
-  override fun onCreate(b: Bundle?) { super.onCreate(b); appCtx = applicationContext; setContent { App() } }
+  override fun onCreate(b: Bundle?) { super.onCreate(b); appCtx = applicationContext; initEngine(application); setContent { App() } }
 }
 
 @Composable
@@ -94,6 +94,7 @@ fun App() {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
               Circle("↑", t("إرسال", "Send"), ac) { items = listOf(); status = ""; screen = "pick" }
               Circle("↓", t("استقبال", "Receive"), ac) { status = ""; screen = "scan" }
+              Circle("♫", t("الصوت", "Audio"), ac) { status = ""; screen = "tools" }
             }
             Spacer(Modifier.height(30.dp))
             if (status.isNotEmpty()) Text(status)
@@ -107,6 +108,7 @@ fun App() {
           if (screen == "pick") PickScreen(Modifier.weight(1f), items, { items = it }, { m -> pick.launch(m) }, { folderPick.launch(null) }, apps, pm, ac, ar) {
             perm.launch(if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES) else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
           }
+          if (screen == "tools") ToolsScreen(ac, ar)
           if (screen == "scan") ScanScreen(Modifier.weight(1f), ar, ac, { stopAll(ctx); screen = "home" }) { onScan(it) }
           if (screen == "send") SendPanel(ac, ar, status, img, payload?.let { JSONObject(it).optString("s") } ?: "", fast, { fast = it; fastMode = it; fastLock(ctx, it) }, { tick++ })
           if (screen == "recv") Text(status, Modifier.fillMaxWidth(), fontSize = 16.sp)
