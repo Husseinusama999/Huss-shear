@@ -51,9 +51,10 @@ fun ytRun(rq: YoutubeDLRequest, onP: (Float) -> Unit) { YoutubeDL.getInstance().
 fun runFfmpeg(args: List<String>): Pair<Int, String> {
   val bin = File(appCtx.applicationInfo.nativeLibraryDir, "libffmpeg.so")
   if (!bin.exists()) return 127 to "ffmpeg binary not found: ${bin.absolutePath}"
-  val libs = File(appCtx.noBackupFilesDir, "youtubedl-android/packages/ffmpeg/usr/lib")
+  val pk = File(appCtx.noBackupFilesDir, "youtubedl-android/packages")
+  val libs = listOf("python", "ffmpeg", "aria2c").map { File(pk, "$it/usr/lib").absolutePath } + appCtx.applicationInfo.nativeLibraryDir
   val pb = ProcessBuilder(listOf(bin.absolutePath, "-hide_banner", "-nostats") + args).redirectErrorStream(true)
-  pb.environment()["LD_LIBRARY_PATH"] = libs.absolutePath
+  pb.environment()["LD_LIBRARY_PATH"] = libs.joinToString(":")
   val p = pb.start(); val out = p.inputStream.bufferedReader().readText()
   return p.waitFor() to out
 }
