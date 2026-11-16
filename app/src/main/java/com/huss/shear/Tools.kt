@@ -20,10 +20,24 @@ import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
 import java.io.File
 import java.util.Locale
+import java.net.HttpURLConnection
+import java.net.URL
+import org.schabi.newpipe.extractor.MediaFormat
+import org.schabi.newpipe.extractor.NewPipe
+import org.schabi.newpipe.extractor.downloader.Downloader
+import org.schabi.newpipe.extractor.downloader.Request
+import org.schabi.newpipe.extractor.downloader.Response
+import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
+import org.schabi.newpipe.extractor.localization.Localization
+import org.schabi.newpipe.extractor.stream.AudioStream
+import org.schabi.newpipe.extractor.stream.DeliveryMethod
+import org.schabi.newpipe.extractor.stream.StreamInfo
+import org.schabi.newpipe.extractor.stream.VideoStream
 
 var engine by mutableStateOf("loading")
 
 fun initEngine(app: Application) {
+  try { NewPipe.init(Dl(), Localization.DEFAULT) } catch (e: Throwable) {}
   Thread { try { YoutubeDL.getInstance().init(app); FFmpeg.getInstance().init(app); engine = "ok" } catch (e: Throwable) { engine = "✗ ${e.message}" } }.start()
 }
 
@@ -68,7 +82,7 @@ fun linkJob(url: String, opt: String, br: Int, dir: File, onP: (Float) -> Unit, 
       val audio = opt == "MP3" || opt == "M4A"
       val rq = YoutubeDLRequest(url).addOption("--no-playlist").addOption("-o", dir.absolutePath + "/%(title).80s.%(ext)s")
       if (audio) rq.addOption("-f", "ba/b")
-      else { val h = opt.removeSuffix("p"); rq.addOption("-f", "bv*[height<=$h]+ba/b[height<=$h]/b"); rq.addOption("--merge-output-format", "mp4") }
+      else { val h = opt.removeSuffix("p"); rq.addOption("-f", if (h == "best") "bv*+ba/b" else "bv*[height<=$h]+ba/b[height<=$h]/b"); rq.addOption("--merge-output-format", "mp4") }
       var err: String? = null
       try { ytRun(rq, onP) } catch (e: Throwable) { err = e.message }
       val outs = ArrayList<File>()
@@ -90,6 +104,82 @@ fun linkJob(url: String, opt: String, br: Int, dir: File, onP: (Float) -> Unit, 
       }
       outs.forEach { exportFile(it) }
       done("✓ Download/HussShear: " + outs.joinToString { it.name })
+    } catch (e: Throwable) { done("✗ ${e.message}") }
+    dir.deleteRecursively()
+  }.start()
+}
+
+var ytInfo: StreamInfo? = null
+const val UA = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+class Dl : Downloader() {
+  override fun execute(request: Request): Response {
+    val c = URL(request.url()).openConnection() as HttpURLConnection
+    c.requestMethod = request.httpMethod(); c.connectTimeout = 30000; c.readTimeout = 30000
+    c.setRequestProperty("User-Agent", UA)
+    request.headers().forEach { (k, v) -> c.setRequestProperty(k, v.joinToString(",")) }
+    val body = request.dataToSend()
+    if (body != null) { c.doOutput = true; c.outputStream.use { it.write(body) } }
+    val code = c.responseCode
+    if (code == 429) throw ReCaptchaException("captcha", request.url())
+    val text = (if (code >= 400) c.errorStream else c.inputStream)?.use { String(it.readBytes(), Charsets.UTF_8) } ?: ""
+    val hs = c.headerFields.entries.filter { it.key != null }.associate { it.key!! to it.value.toList() }
+    return Response(code, c.responseMessage ?: "", hs, text, c.url.toString())
+  }
+}
+
+fun isYt(u: String) = Regex("(youtube\\.com|youtu\\.be)").containsMatchIn(u)
+
+fun ytStreams(i: StreamInfo): List<VideoStream> = (i.videoOnlyStreams + i.videoStreams).filter { it.height > 0 && it.isUrl && it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP }
+fun ytHeights(i: StreamInfo): List<Int> = ytStreams(i).map { it.height }.distinct().sortedDescending()
+fun ytVideo(i: StreamInfo, h: Int): VideoStream? = ytStreams(i).filter { it.height == h }.sortedByDescending { if (it.format == MediaFormat.MPEG_4) 1 else 0 }.firstOrNull()
+fun ytAudio(i: StreamInfo): AudioStream? = i.audioStreams.filter { it.isUrl && it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP }
+  .sortedWith(compareByDescending<AudioStream> { it.format == MediaFormat.M4A }.thenByDescending { it.averageBitrate }).firstOrNull()
+
+fun fetchFile(url: String, out: File, onP: (Float) -> Unit) {
+  var pos = 0L; var total = -1L; val ch = 8L * 1024 * 1024
+  out.outputStream().use { o ->
+    while (total < 0 || pos < total) {
+      val c = URL(url).openConnection() as HttpURLConnection
+      c.setRequestProperty("User-Agent", UA); c.setRequestProperty("Range", "bytes=$pos-${pos + ch - 1}")
+      c.connectTimeout = 30000; c.readTimeout = 30000
+      val code = c.responseCode
+      if (code != 200 && code != 206) throw Exception("HTTP $code")
+      if (total < 0) total = if (code == 206) (c.getHeaderField("Content-Range")?.substringAfter('/')?.toLongOrNull() ?: -1L) else c.contentLengthLong
+      var n = 0L; val buf = ByteArray(262144)
+      c.inputStream.use { i -> var k = i.read(buf); while (k > 0) { o.write(buf, 0, k); n += k; onP(if (total > 0) ((pos + n).toFloat() / total).coerceIn(0f, 1f) else 0f); k = i.read(buf) } }
+      pos += n
+      if (code == 200 || n == 0L) break
+    }
+  }
+}
+
+fun ytJob(info: StreamInfo, mp3: Boolean, h: Int, br: Int, dir: File, onP: (Float) -> Unit, done: (String) -> Unit) {
+  Thread {
+    try {
+      val title = info.name.replace(Regex("[\\\\/:*?\"<>|%]"), "_").take(80)
+      val aud = ytAudio(info) ?: throw Exception("no audio stream")
+      val out: File
+      if (mp3) {
+        val a = File(dir, "a.bin"); fetchFile(aud.content, a) { onP(it * 90f) }
+        out = File(dir, "$title.mp3")
+        val r = runFfmpeg(listOf("-y", "-i", a.absolutePath, "-vn", "-c:a", "libmp3lame", "-b:a", "${br}k", out.absolutePath))
+        if (r.first != 0) throw Exception(r.second.takeLast(300))
+      } else {
+        val v = ytVideo(info, h) ?: throw Exception("no video stream")
+        val vf = File(dir, "v.bin"); fetchFile(v.content, vf) { onP(it * 45f) }
+        out = File(dir, "$title.mp4")
+        val args = ArrayList<String>(listOf("-y", "-i", vf.absolutePath))
+        if (v.isVideoOnly) {
+          val af = File(dir, "a.bin"); fetchFile(aud.content, af) { onP(45f + it * 45f) }
+          args.addAll(listOf("-i", af.absolutePath, "-map", "0:v:0", "-map", "1:a:0"))
+        }
+        args.addAll(listOf("-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out.absolutePath))
+        val r = runFfmpeg(args)
+        if (r.first != 0) throw Exception(r.second.takeLast(300))
+      }
+      exportFile(out)
+      done("✓ Download/HussShear: " + out.name)
     } catch (e: Throwable) { done("✗ ${e.message}") }
     dir.deleteRecursively()
   }.start()
@@ -117,7 +207,8 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
   fun t(a: String, e: String) = if (ar) a else e
   var url by remember { mutableStateOf("") }
   var heights by remember { mutableStateOf(listOf<Int>()) }
-  var opt by remember { mutableStateOf("MP3") }
+  var kind by remember { mutableStateOf("MP3") }
+  var h by remember { mutableIntStateOf(0) }
   var br by remember { mutableIntStateOf(320) }
   var pr by remember { mutableFloatStateOf(0f) }
   var st by remember { mutableStateOf("") }
@@ -140,25 +231,35 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
   if (engine != "ok") Text((if (engine == "loading") t("جاري تجهيز المحرك…", "Preparing engine…") else engine), fontSize = 12.sp)
   OutlinedTextField(url, { url = it }, Modifier.fillMaxWidth(), label = { Text(t("رابط فيديو أو ملف صوت", "Video or audio link")) }, singleLine = true)
   Button({
-    busy = true; st = "…"
+    busy = true; st = "…"; ytInfo = null
     Thread {
       try {
-        val i = YoutubeDL.getInstance().getInfo(url.trim())
-        heights = (i.formats ?: arrayListOf()).filter { (it.vcodec ?: "none") != "none" && it.height > 0 }.map { it.height }.distinct().sortedDescending()
-        opt = if (heights.isEmpty()) "MP3" else "${heights.first()}p"
-        finish(i.title ?: "")
+        if (isYt(url)) { val i = StreamInfo.getInfo(url.trim()); ytInfo = i; heights = ytHeights(i); finish(i.name) }
+        else {
+          val i = YoutubeDL.getInstance().getInfo(url.trim())
+          heights = (i.formats ?: arrayListOf()).filter { (it.vcodec ?: "none") != "none" && it.height > 0 }.map { it.height }.distinct().sortedDescending()
+          finish(i.title ?: "")
+        }
+        if (heights.isNotEmpty()) h = heights.first()
       } catch (e: Throwable) { finish("✗ ${e.message}") }
     }.start()
-  }, enabled = ok && url.isNotBlank()) { Text(t("جلب الجودات", "Fetch qualities")) }
-  Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-    (heights.map { "${it}p" } + listOf("MP3", "M4A")).forEach { o -> Opt(o, opt == o) { opt = o } }
+  }, enabled = (ok || (!busy && isYt(url))) && url.isNotBlank()) { Text(t("جلب الجودات", "Fetch qualities")) }
+  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { Opt("MP3", kind == "MP3") { kind = "MP3" }; Opt("MP4", kind == "MP4") { kind = "MP4" } }
+  if (kind == "MP3") {
+    Text(t("جودة الصوت (kbps)", "Audio quality (kbps)"))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf(128, 192, 256, 320).forEach { b -> Opt("$b", br == b) { br = b } } }
+  } else {
+    Text(t("جودة الفيديو", "Video quality"))
+    if (heights.isEmpty()) Text(t("اضغط «جلب الجودات» الأول", "Tap “Fetch qualities” first"), fontSize = 12.sp)
+    else Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) { heights.forEach { x -> Opt("${x}p", h == x) { h = x } } }
   }
-  if (opt == "MP3" || opt == "M4A") Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf(128, 192, 256, 320).forEach { b -> Opt("$b", br == b) { br = b } } }
   Button({
     busy = true; pr = 0f; st = "…"
     val dir = tmp()
-    linkJob(url.trim(), opt, br, dir, { pr = it / 100f }) { finish(it) }
-  }, Modifier.fillMaxWidth(), enabled = ok && url.isNotBlank()) { Text(t("نزّل", "Download")) }
+    val yi = ytInfo
+    if (yi != null && isYt(url)) ytJob(yi, kind == "MP3", h, br, dir, { pr = it / 100f }) { finish(it) }
+    else linkJob(url.trim(), if (kind == "MP3") "MP3" else if (h > 0) "${h}p" else "best", br, dir, { pr = it / 100f }) { finish(it) }
+  }, Modifier.fillMaxWidth(), enabled = (ok || (!busy && isYt(url) && ytInfo != null)) && url.isNotBlank()) { Text(t("نزّل", "Download")) }
   HorizontalDivider()
   Text(t("تحويل ملف لصوت", "Convert a file to audio"), fontSize = 18.sp, fontWeight = FontWeight.Bold)
   OutlinedButton({ pickF.launch(arrayOf("video/*", "audio/*")) }) { Text(if (fileName.isEmpty()) t("اختار فيديو أو أغنية", "Pick a video or song") else fileName) }
