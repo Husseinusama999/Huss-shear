@@ -166,7 +166,7 @@ fun ytJob(info: StreamInfo, mp3: Boolean, h: Int, br: Int, dir: File, onP: (Floa
         val r = runFfmpeg(listOf("-y", "-i", a.absolutePath, "-vn", "-c:a", "libmp3lame", "-b:a", "${br}k", out.absolutePath))
         if (r.first != 0) throw Exception(r.second.takeLast(300))
       } else {
-        val v = ytVideo(info, h) ?: throw Exception("no video stream")
+        val v = ytVideo(info, if (h > 0) h else (ytHeights(info).firstOrNull() ?: 0)) ?: throw Exception("no video stream")
         val vf = File(dir, "v.bin"); fetchFile(v.content, vf) { onP(it * 45f) }
         out = File(dir, "$title.mp4")
         val args = ArrayList<String>(listOf("-y", "-i", vf.absolutePath))
@@ -257,9 +257,14 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
     busy = true; pr = 0f; st = "…"
     val dir = tmp()
     val yi = ytInfo
-    if (yi != null && isYt(url)) ytJob(yi, kind == "MP3", h, br, dir, { pr = it / 100f }) { finish(it) }
-    else linkJob(url.trim(), if (kind == "MP3") "MP3" else if (h > 0) "${h}p" else "best", br, dir, { pr = it / 100f }) { finish(it) }
-  }, Modifier.fillMaxWidth(), enabled = (ok || (!busy && isYt(url) && ytInfo != null)) && url.isNotBlank()) { Text(t("نزّل", "Download")) }
+    if (isYt(url)) {
+      if (yi != null) ytJob(yi, kind == "MP3", h, br, dir, { pr = it / 100f }) { finish(it) }
+      else Thread {
+        try { val i = StreamInfo.getInfo(url.trim()); ytInfo = i; ytJob(i, kind == "MP3", h, br, dir, { pr = it / 100f }) { finish(it) } }
+        catch (e: Throwable) { finish("✗ NewPipe: ${e.message}"); dir.deleteRecursively() }
+      }.start()
+    } else linkJob(url.trim(), if (kind == "MP3") "MP3" else if (h > 0) "${h}p" else "best", br, dir, { pr = it / 100f }) { finish(it) }
+  }, Modifier.fillMaxWidth(), enabled = (ok || (!busy && isYt(url))) && url.isNotBlank()) { Text(t("نزّل", "Download")) }
   HorizontalDivider()
   Text(t("تحويل ملف لصوت", "Convert a file to audio"), fontSize = 18.sp, fontWeight = FontWeight.Bold)
   OutlinedButton({ pickF.launch(arrayOf("video/*", "audio/*")) }) { Text(if (fileName.isEmpty()) t("اختار فيديو أو أغنية", "Pick a video or song") else fileName) }
