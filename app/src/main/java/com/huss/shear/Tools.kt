@@ -278,7 +278,7 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
     Opt(t("صوت المغني بس", "Vocals only"), mode == "voc") { mode = "voc" }
     Opt(t("موسيقى بس", "Music only"), mode == "inst") { mode = "inst" }
   }
-  if (doIso) Text(t("أول مرة بينزّل موديل حوالي 65 ميجا (محتاج إنترنت). العزل عالي الجودة وبياخد وقت طويل، ممكن يوصل لعدة أضعاف مدة الأغنية حسب موبايلك.", "First use downloads a ~65 MB model (needs internet). High-quality isolation is slow, possibly several times the song length depending on your phone."), fontSize = 12.sp)
+  if (doIso) Text(t("أول مرة بينزّل موديل حوالي 35 ميجا (محتاج إنترنت)", "First use downloads a ~35 MB model (needs internet)"), fontSize = 12.sp)
   if (fmt == "mp3") OutlinedButton({ pickC.launch("image/*") }) { Text(if (cover == null) t("صورة الغلاف (اختياري)", "Cover art (optional)") else t("تم اختيار الغلاف ✓", "Cover selected ✓")) }
   Button({
     val u = fileUri ?: return@Button
@@ -294,7 +294,7 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
         var inArgs = listOf("-i", inF.absolutePath)
         if (doIso) {
           st = t("جاري تجهيز موديل الذكاء الاصطناعي…", "Preparing AI model…")
-          val mf = ensureMdx(mode == "voc") { pr = it * 0.2f }
+          val (vm, am) = ensureModels { pr = it * 0.2f }
           st = t("جاري فك الصوت…", "Decoding audio…"); pr = 0.2f
           val raw = File(dir, "in.f32")
           val d = runFfmpeg(listOf("-y", "-i", inF.absolutePath, "-vn", "-f", "f32le", "-ar", "44100", "-ac", "2", raw.absolutePath))
@@ -302,7 +302,7 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
           inF.delete()
           st = t("جاري العزل بالذكاء الاصطناعي…", "AI separating…")
           val stem = File(dir, "stem.f32")
-          Mdx(mf, if (mode == "voc") 7680 else 6144).run(raw, stem) { pr = 0.25f + it * 0.65f }
+          Sep(vm, am).run(raw, stem, mode == "voc") { pr = 0.25f + it * 0.65f }
           raw.delete()
           inArgs = listOf("-f", "f32le", "-ar", "44100", "-ac", "2", "-i", stem.absolutePath)
           st = t("جاري الترميز…", "Encoding…"); pr = -1f
