@@ -5,7 +5,7 @@ android {
   compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17; isCoreLibraryDesugaringEnabled = true }
   kotlinOptions { jvmTarget = "17" }
   buildFeatures { compose = true }
-  packaging { jniLibs { useLegacyPackaging = true } }
+  packaging { jniLibs { useLegacyPackaging = true }; resources { excludes += listOf("META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/DEPENDENCIES", "META-INF/INDEX.LIST") } }
 }
 dependencies {
   implementation(platform("androidx.compose:compose-bom:2024.09.00"))
@@ -15,6 +15,8 @@ dependencies {
   implementation("com.google.zxing:core:3.5.3")
   implementation("org.nanohttpd:nanohttpd:2.3.1")
   implementation("com.github.teamnewpipe:NewPipeExtractor:v0.27.1")
+  implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+  implementation("org.apache.commons:commons-compress:1.27.1")
   coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.0.4")
   implementation("io.github.junkfood02.youtubedl-android:library:0.16.0")
   implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.16.0")
