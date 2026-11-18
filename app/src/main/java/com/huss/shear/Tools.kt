@@ -220,6 +220,7 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
   var doExtract by remember { mutableStateOf(true) }
   var doBoost by remember { mutableStateOf(false) }
   var doIso by remember { mutableStateOf(false) }
+  var q by remember { mutableIntStateOf(0) }
   var gain by remember { mutableFloatStateOf(100f) }
   var cover by remember { mutableStateOf<ByteArray?>(null) }
   val pickF = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> if (u != null) { fileUri = u; fileName = itemOf(c, u).name } }
@@ -278,7 +279,12 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
     Opt(t("صوت المغني بس", "Vocals only"), mode == "voc") { mode = "voc" }
     Opt(t("موسيقى بس", "Music only"), mode == "inst") { mode = "inst" }
   }
-  if (doIso) Text(t("أول مرة بينزّل موديل حوالي 35 ميجا (محتاج إنترنت)", "First use downloads a ~35 MB model (needs internet)"), fontSize = 12.sp)
+  if (doIso) Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Opt(t("سريع", "Fast"), q == 0) { q = 0 }
+    Opt(t("متوسط", "Medium"), q == 1) { q = 1 }
+    Opt(t("أعلى جودة", "Best"), q == 2) { q = 2 }
+  }
+  if (doIso) Text(t("سريع: حوالي 35 ميجا. متوسط: حوالي 30 ميجا، أبطأ بحوالي 10 أضعاف من السريع. أعلى جودة: حوالي 65 ميجا، أبطأ بحوالي 30 ضعف (تقدير على جهاز كمبيوتر، والموبايل أبطأ). أول مرة محتاج إنترنت للتنزيل.", "Fast: ~35 MB. Medium: ~30 MB, roughly 10x slower than Fast. Best: ~65 MB, roughly 30x slower (estimated on a computer, phones are slower). First use needs internet."), fontSize = 12.sp)
   if (fmt == "mp3") OutlinedButton({ pickC.launch("image/*") }) { Text(if (cover == null) t("صورة الغلاف (اختياري)", "Cover art (optional)") else t("تم اختيار الغلاف ✓", "Cover selected ✓")) }
   Button({
     val u = fileUri ?: return@Button
@@ -294,7 +300,9 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
         var inArgs = listOf("-i", inF.absolutePath)
         if (doIso) {
           st = t("جاري تجهيز موديل الذكاء الاصطناعي…", "Preparing AI model…")
-          val (vm, am) = ensureModels { pr = it * 0.2f }
+          val sm = if (q == 0) ensureModels { pr = it * 0.2f } else null
+          val mf = if (q == 1) ensureMdx("UVR_MDXNET_3_9662.onnx") { pr = it * 0.2f }
+            else if (q == 2) ensureMdx(if (mode == "voc") "UVR-MDX-NET-Voc_FT.onnx" else "UVR-MDX-NET-Inst_HQ_3.onnx") { pr = it * 0.2f } else null
           st = t("جاري فك الصوت…", "Decoding audio…"); pr = 0.2f
           val raw = File(dir, "in.f32")
           val d = runFfmpeg(listOf("-y", "-i", inF.absolutePath, "-vn", "-f", "f32le", "-ar", "44100", "-ac", "2", raw.absolutePath))
@@ -302,7 +310,9 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
           inF.delete()
           st = t("جاري العزل بالذكاء الاصطناعي…", "AI separating…")
           val stem = File(dir, "stem.f32")
-          Sep(vm, am).run(raw, stem, mode == "voc") { pr = 0.25f + it * 0.65f }
+          if (q == 0) Sep(sm!!.first, sm.second).run(raw, stem, mode == "voc") { pr = 0.25f + it * 0.65f }
+          else if (q == 1) Mdx(mf!!, 6144, 2048, 1.035f, mode != "voc", 0.1f).run(raw, stem) { pr = 0.25f + it * 0.65f }
+          else Mdx(mf!!, if (mode == "voc") 7680 else 6144, 3072).run(raw, stem) { pr = 0.25f + it * 0.65f }
           raw.delete()
           inArgs = listOf("-f", "f32le", "-ar", "44100", "-ac", "2", "-i", stem.absolutePath)
           st = t("جاري الترميز…", "Encoding…"); pr = -1f
