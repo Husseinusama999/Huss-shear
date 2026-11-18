@@ -273,11 +273,12 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
   Row(verticalAlignment = Alignment.CenterVertically) { Text(t("استخراج الصوت", "Extract audio"), Modifier.weight(1f)); Switch(doExtract, { doExtract = it }) }
   Row(verticalAlignment = Alignment.CenterVertically) { Text(t("رفع الصوت", "Boost volume"), Modifier.weight(1f)); Switch(doBoost, { doBoost = it }) }
   if (doBoost) { Text("${gain.toInt()}%"); Slider(gain, { gain = it }, valueRange = 100f..300f) }
-  Row(verticalAlignment = Alignment.CenterVertically) { Text(t("عزل (مغني / موسيقى)", "Isolate (vocals / music)"), Modifier.weight(1f)); Switch(doIso, { doIso = it }) }
+  Row(verticalAlignment = Alignment.CenterVertically) { Text(t("عزل بالذكاء الاصطناعي (مغني / موسيقى)", "AI isolation (vocals / music)"), Modifier.weight(1f)); Switch(doIso, { doIso = it }) }
   if (doIso) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
     Opt(t("صوت المغني بس", "Vocals only"), mode == "voc") { mode = "voc" }
     Opt(t("موسيقى بس", "Music only"), mode == "inst") { mode = "inst" }
   }
+  if (doIso) Text(t("أول مرة بينزّل موديل حوالي 65 ميجا (محتاج إنترنت). العزل عالي الجودة وبياخد وقت طويل، ممكن يوصل لعدة أضعاف مدة الأغنية حسب موبايلك.", "First use downloads a ~65 MB model (needs internet). High-quality isolation is slow, possibly several times the song length depending on your phone."), fontSize = 12.sp)
   if (fmt == "mp3") OutlinedButton({ pickC.launch("image/*") }) { Text(if (cover == null) t("صورة الغلاف (اختياري)", "Cover art (optional)") else t("تم اختيار الغلاف ✓", "Cover selected ✓")) }
   Button({
     val u = fileUri ?: return@Button
@@ -289,14 +290,27 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
       try {
         c.contentResolver.openInputStream(u)!!.use { i -> inF.outputStream().use { i.copyTo(it, 262144) } }
         val af = ArrayList<String>()
-        if (doIso && mode == "inst") af.add("pan=stereo|c0=c0-c1|c1=c1-c0")
-        if (doIso && mode == "voc") af.add("pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1")
         if (doBoost && gain.toInt() != 100) { af.add("volume=" + String.format(Locale.US, "%.2f", gain / 100f)); af.add("alimiter=limit=0.97") }
-        if (doIso) af.add(0, "aformat=channel_layouts=stereo")
+        var inArgs = listOf("-i", inF.absolutePath)
+        if (doIso) {
+          st = t("جاري تجهيز موديل الذكاء الاصطناعي…", "Preparing AI model…")
+          val mf = ensureMdx(mode == "voc") { pr = it * 0.2f }
+          st = t("جاري فك الصوت…", "Decoding audio…"); pr = 0.2f
+          val raw = File(dir, "in.f32")
+          val d = runFfmpeg(listOf("-y", "-i", inF.absolutePath, "-vn", "-f", "f32le", "-ar", "44100", "-ac", "2", raw.absolutePath))
+          if (d.first != 0) throw Exception(d.second.takeLast(300))
+          inF.delete()
+          st = t("جاري العزل بالذكاء الاصطناعي…", "AI separating…")
+          val stem = File(dir, "stem.f32")
+          Mdx(mf, if (mode == "voc") 7680 else 6144).run(raw, stem) { pr = 0.25f + it * 0.65f }
+          raw.delete()
+          inArgs = listOf("-f", "f32le", "-ar", "44100", "-ac", "2", "-i", stem.absolutePath)
+          st = t("جاري الترميز…", "Encoding…"); pr = -1f
+        }
         outDir.mkdirs()
         val outF = File(outDir, stem + "." + fmt)
         val cv = cover?.let { File(dir, "cover.jpg").also { f -> f.writeBytes(it) } }
-        val a = ArrayList<String>(listOf("-y", "-i", inF.absolutePath))
+        val a = ArrayList<String>(listOf("-y") + inArgs)
         if (cv != null) a.addAll(listOf("-i", cv.absolutePath))
         a.addAll(listOf("-map", "0:a:0"))
         if (cv != null) a.addAll(listOf("-map", "1:v:0"))
