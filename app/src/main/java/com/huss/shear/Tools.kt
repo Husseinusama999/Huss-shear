@@ -60,9 +60,9 @@ fun withCover(mp3: File, img: ByteArray) {
   mp3.writeBytes(hdr + frame + old.copyOfRange(off, old.size))
 }
 
-fun ytRun(rq: YoutubeDLRequest, onP: (Float) -> Unit) { YoutubeDL.getInstance().execute(rq, "huss", { p, _, _ -> onP(p) }) }
+fun ytRun(rq: YoutubeDLRequest, onP: (Float) -> Unit, onLine: (Float, String) -> Unit = { _, _ -> }) { YoutubeDL.getInstance().execute(rq, "huss", { p, _, line -> onP(p); onLine(p, line) }) }
 
-fun runFfmpeg(args: List<String>): Pair<Int, String> {
+fun runFfmpeg(args: List<String>, job: JobH? = null): Pair<Int, String> {
   val bin = File(appCtx.applicationInfo.nativeLibraryDir, "libffmpeg.so")
   if (!bin.exists()) return 127 to "ffmpeg binary not found: ${bin.absolutePath}"
   val libs = ArrayList<String>()
@@ -71,12 +71,15 @@ fun runFfmpeg(args: List<String>): Pair<Int, String> {
   val hasCpp = libs.any { File(it, "libc++_shared.so").exists() }
   val pb = ProcessBuilder(listOf(bin.absolutePath, "-hide_banner", "-nostats") + args).redirectErrorStream(true)
   pb.environment()["LD_LIBRARY_PATH"] = libs.joinToString(":")
-  val p = pb.start(); val out = p.inputStream.bufferedReader().readText()
+  val p = pb.start(); job?.proc = p; val out = p.inputStream.bufferedReader().readText()
   val code = p.waitFor()
   return code to (if (code != 0) out + "\n[c++ shared found: $hasCpp; lib dirs: ${libs.size}]" else out)
 }
 
-fun linkJob(url: String, opt: String, br: Int, dir: File, onP: (Float) -> Unit, done: (String) -> Unit) {
+fun linkJob(url: String, opt: String, br: Int, dir: File, onP: (Float) -> Unit, done0: (String) -> Unit) {
+  val job = Jobs.start(url.take(60))
+  job.onCancel = { try { YoutubeDL.getInstance().destroyProcessById("huss") } catch (e: Throwable) {} }
+  val done: (String) -> Unit = { job.finish(it.startsWith("✓"), it); done0(it) }
   Thread {
     try {
       val audio = opt == "MP3" || opt == "M4A"
@@ -84,20 +87,30 @@ fun linkJob(url: String, opt: String, br: Int, dir: File, onP: (Float) -> Unit, 
       if (audio) rq.addOption("-f", "ba/b")
       else { val h = opt.removeSuffix("p"); rq.addOption("-f", if (h == "best") "bv*+ba/b" else "bv*[height<=$h]+ba/b[height<=$h]/b"); rq.addOption("--merge-output-format", "mp4") }
       var err: String? = null
-      try { ytRun(rq, onP) } catch (e: Throwable) { err = e.message }
+      try {
+        ytRun(rq, onP) { p, line ->
+          val m = Regex("of\\s+~?\\s*([0-9.]+)\\s*(KiB|MiB|GiB)").find(line)
+          if (m != null) {
+            val mult = when (m.groupValues[2]) { "KiB" -> 1024.0; "MiB" -> 1048576.0; else -> 1073741824.0 }
+            val tot = (m.groupValues[1].toDouble() * mult).toLong(); job.bytes((tot * p / 100.0).toLong(), tot)
+          } else job.percent(p / 100f)
+        }
+      } catch (e: Throwable) { err = e.message }
       val outs = ArrayList<File>()
       val files = dir.listFiles()?.filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") } ?: listOf()
       if (audio) {
         val src = files.maxByOrNull { it.length() } ?: throw Exception(err ?: "no file")
         val out = File(dir, src.nameWithoutExtension + "." + opt.lowercase())
-        val r = runFfmpeg(listOf("-y", "-i", src.absolutePath, "-vn", "-c:a", if (opt == "MP3") "libmp3lame" else "aac", "-b:a", "${br}k", out.absolutePath))
+        job.percent(-1f, "Converting / تحويل")
+        val r = runFfmpeg(listOf("-y", "-i", src.absolutePath, "-vn", "-c:a", if (opt == "MP3") "libmp3lame" else "aac", "-b:a", "${br}k", out.absolutePath), job)
         if (r.first != 0) throw Exception(r.second.takeLast(300))
         outs.add(out)
       } else {
         val frag = files.filter { Regex("\\.f\\d+\\.").containsMatchIn(it.name) }.sortedByDescending { it.length() }
         if (frag.size >= 2) {
           val out = File(dir, frag[0].name.replace(Regex("\\.f\\d+\\."), ".").substringBeforeLast('.') + ".mp4")
-          val r = runFfmpeg(listOf("-y", "-i", frag[0].absolutePath, "-i", frag[1].absolutePath, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", out.absolutePath))
+          job.percent(-1f, "Merging / دمج")
+          val r = runFfmpeg(listOf("-y", "-i", frag[0].absolutePath, "-i", frag[1].absolutePath, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", out.absolutePath), job)
           if (r.first != 0) throw Exception(r.second.takeLast(300))
           outs.add(out)
         } else if (files.isNotEmpty() && err == null) outs.addAll(files) else throw Exception(err ?: "no file")
@@ -136,7 +149,14 @@ fun ytVideo(i: StreamInfo, h: Int): VideoStream? = ytStreams(i).filter { it.heig
 fun ytAudio(i: StreamInfo): AudioStream? = i.audioStreams.filter { it.isUrl && it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP }
   .sortedWith(compareByDescending<AudioStream> { it.format == MediaFormat.M4A }.thenByDescending { it.averageBitrate }).firstOrNull()
 
-fun fetchFile(url: String, out: File, onP: (Float) -> Unit) {
+fun probeSize(url: String): Long = try {
+  val c = URL(url).openConnection() as HttpURLConnection
+  c.setRequestProperty("User-Agent", UA); c.setRequestProperty("Range", "bytes=0-0"); c.connectTimeout = 20000; c.readTimeout = 20000
+  val n = c.getHeaderField("Content-Range")?.substringAfter('/')?.toLongOrNull() ?: c.contentLengthLong
+  c.inputStream.close(); n
+} catch (e: Exception) { 0L }
+
+fun fetchFile(url: String, out: File, onB: (Long, Long) -> Unit = { _, _ -> }, onP: (Float) -> Unit) {
   var pos = 0L; var total = -1L; val ch = 8L * 1024 * 1024
   out.outputStream().use { o ->
     while (total < 0 || pos < total) {
@@ -147,35 +167,40 @@ fun fetchFile(url: String, out: File, onP: (Float) -> Unit) {
       if (code != 200 && code != 206) throw Exception("HTTP $code")
       if (total < 0) total = if (code == 206) (c.getHeaderField("Content-Range")?.substringAfter('/')?.toLongOrNull() ?: -1L) else c.contentLengthLong
       var n = 0L; val buf = ByteArray(262144)
-      c.inputStream.use { i -> var k = i.read(buf); while (k > 0) { o.write(buf, 0, k); n += k; onP(if (total > 0) ((pos + n).toFloat() / total).coerceIn(0f, 1f) else 0f); k = i.read(buf) } }
+      c.inputStream.use { i -> var k = i.read(buf); while (k > 0) { o.write(buf, 0, k); n += k; onP(if (total > 0) ((pos + n).toFloat() / total).coerceIn(0f, 1f) else 0f); onB(pos + n, total); k = i.read(buf) } }
       pos += n
       if (code == 200 || n == 0L) break
     }
   }
 }
 
-fun ytJob(info: StreamInfo, mp3: Boolean, h: Int, br: Int, dir: File, onP: (Float) -> Unit, done: (String) -> Unit) {
+fun ytJob(info: StreamInfo, mp3: Boolean, h: Int, br: Int, dir: File, onP: (Float) -> Unit, done0: (String) -> Unit) {
+  val job = Jobs.start(info.name)
+  val done: (String) -> Unit = { job.finish(it.startsWith("✓"), it); done0(it) }
   Thread {
     try {
       val title = info.name.replace(Regex("[\\\\/:*?\"<>|%]"), "_").take(80)
       val aud = ytAudio(info) ?: throw Exception("no audio stream")
       val out: File
       if (mp3) {
-        val a = File(dir, "a.bin"); fetchFile(aud.content, a) { onP(it * 90f) }
+        val a = File(dir, "a.bin"); fetchFile(aud.content, a, { d, tt -> job.bytes(d, tt) }) { onP(it * 90f) }
+        job.percent(-1f, "Converting / تحويل")
         out = File(dir, "$title.mp3")
-        val r = runFfmpeg(listOf("-y", "-i", a.absolutePath, "-vn", "-c:a", "libmp3lame", "-b:a", "${br}k", out.absolutePath))
+        val r = runFfmpeg(listOf("-y", "-i", a.absolutePath, "-vn", "-c:a", "libmp3lame", "-b:a", "${br}k", out.absolutePath), job)
         if (r.first != 0) throw Exception(r.second.takeLast(300))
       } else {
         val v = ytVideo(info, if (h > 0) h else (ytHeights(info).firstOrNull() ?: 0)) ?: throw Exception("no video stream")
-        val vf = File(dir, "v.bin"); fetchFile(v.content, vf) { onP(it * 45f) }
+        val vt = probeSize(v.content); val at = if (v.isVideoOnly) probeSize(aud.content) else 0L
+        val vf = File(dir, "v.bin"); fetchFile(v.content, vf, { d, _ -> job.bytes(d, vt + at) }) { onP(it * 45f) }
         out = File(dir, "$title.mp4")
         val args = ArrayList<String>(listOf("-y", "-i", vf.absolutePath))
         if (v.isVideoOnly) {
-          val af = File(dir, "a.bin"); fetchFile(aud.content, af) { onP(45f + it * 45f) }
+          val af = File(dir, "a.bin"); fetchFile(aud.content, af, { d, _ -> job.bytes(vt + d, vt + at) }) { onP(45f + it * 45f) }
           args.addAll(listOf("-i", af.absolutePath, "-map", "0:v:0", "-map", "1:a:0"))
         }
         args.addAll(listOf("-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out.absolutePath))
-        val r = runFfmpeg(args)
+        job.percent(-1f, "Merging / دمج")
+        val r = runFfmpeg(args, job)
         if (r.first != 0) throw Exception(r.second.takeLast(300))
       }
       exportFile(out)
@@ -254,6 +279,8 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
     val dir = tmp(); val outDir = File(dir, "out")
     val stem = fileName.substringBeforeLast('.').replace("/", "_").replace("%", "%%")
     val inF = File(dir, "in_" + System.currentTimeMillis() + "." + fileName.substringAfterLast('.', "bin"))
+    val job = Jobs.start(t("تحويل: ", "Converting: ") + fileName)
+    fun setP(v: Float) { pr = v; job.percent(v) }
     Thread {
       try {
         c.contentResolver.openInputStream(u)!!.use { i -> inF.outputStream().use { i.copyTo(it, 262144) } }
@@ -262,22 +289,22 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
         var inArgs = listOf("-i", inF.absolutePath)
         if (doIso) {
           st = t("جاري تجهيز موديل الذكاء الاصطناعي…", "Preparing AI model…")
-          val sm = if (q == 0) ensureModels { pr = it * 0.2f } else null
-          val mf = if (q == 1) ensureMdx("UVR_MDXNET_3_9662.onnx") { pr = it * 0.2f }
-            else if (q == 2) ensureMdx(if (mode == "voc") "UVR-MDX-NET-Voc_FT.onnx" else "UVR-MDX-NET-Inst_HQ_3.onnx") { pr = it * 0.2f } else null
-          st = t("جاري فك الصوت…", "Decoding audio…"); pr = 0.2f
+          val sm = if (q == 0) ensureModels { setP(it * 0.2f) } else null
+          val mf = if (q == 1) ensureMdx("UVR_MDXNET_3_9662.onnx") { setP(it * 0.2f) }
+            else if (q == 2) ensureMdx(if (mode == "voc") "UVR-MDX-NET-Voc_FT.onnx" else "UVR-MDX-NET-Inst_HQ_3.onnx") { setP(it * 0.2f) } else null
+          st = t("جاري فك الصوت…", "Decoding audio…"); setP(0.2f)
           val raw = File(dir, "in.f32")
-          val d = runFfmpeg(listOf("-y", "-i", inF.absolutePath, "-vn", "-f", "f32le", "-ar", "44100", "-ac", "2", raw.absolutePath))
+          val d = runFfmpeg(listOf("-y", "-i", inF.absolutePath, "-vn", "-f", "f32le", "-ar", "44100", "-ac", "2", raw.absolutePath), job)
           if (d.first != 0) throw Exception(d.second.takeLast(300))
           inF.delete()
           st = t("جاري العزل بالذكاء الاصطناعي…", "AI separating…")
           val stem = File(dir, "stem.f32")
-          if (q == 0) Sep(sm!!.first, sm.second).run(raw, stem, mode == "voc") { pr = 0.25f + it * 0.65f }
-          else if (q == 1) Mdx(mf!!, 6144, 2048, 1.035f, mode != "voc", 0.1f).run(raw, stem) { pr = 0.25f + it * 0.65f }
-          else Mdx(mf!!, if (mode == "voc") 7680 else 6144, 3072).run(raw, stem) { pr = 0.25f + it * 0.65f }
+          if (q == 0) Sep(sm!!.first, sm.second).run(raw, stem, mode == "voc") { setP(0.25f + it * 0.65f) }
+          else if (q == 1) Mdx(mf!!, 6144, 2048, 1.035f, mode != "voc", 0.1f).run(raw, stem) { setP(0.25f + it * 0.65f) }
+          else Mdx(mf!!, if (mode == "voc") 7680 else 6144, 3072).run(raw, stem) { setP(0.25f + it * 0.65f) }
           raw.delete()
           inArgs = listOf("-f", "f32le", "-ar", "44100", "-ac", "2", "-i", stem.absolutePath)
-          st = t("جاري الترميز…", "Encoding…"); pr = -1f
+          st = t("جاري الترميز…", "Encoding…"); setP(-1f)
         }
         outDir.mkdirs()
         val outF = File(outDir, stem + "." + fmt)
@@ -290,11 +317,12 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
         a.addAll(listOf("-c:a", if (fmt == "mp3") "libmp3lame" else "aac", "-b:a", "${br}k"))
         if (cv != null) { a.addAll(listOf("-c:v", "mjpeg", "-disposition:v:0", "attached_pic")); if (fmt == "mp3") a.addAll(listOf("-id3v2_version", "3")) }
         a.add(outF.absolutePath)
-        val r = runFfmpeg(a)
-        if (r.first != 0 || !outF.exists()) finish("✗ " + r.second.takeLast(300))
-        else { exportFile(outF); finish("✓ Download/HussShear: " + outF.name) }
+        job.percent(-1f, "Converting / تحويل")
+        val r = runFfmpeg(a, job)
+        if (r.first != 0 || !outF.exists()) { job.finish(false, "✗ " + r.second.takeLast(300)); finish("✗ " + r.second.takeLast(300)) }
+        else { exportFile(outF); job.finish(true, "✓ " + outF.name); finish("✓ Download/HussShear: " + outF.name) }
         dir.deleteRecursively()
-      } catch (e: Throwable) { finish("✗ ${e.message}"); dir.deleteRecursively() }
+      } catch (e: Throwable) { job.finish(false, "✗ ${e.message}"); finish("✗ ${e.message}"); dir.deleteRecursively() }
     }.start()
   }, Modifier.fillMaxWidth(), enabled = ok && fileUri != null && (doExtract || doBoost || doIso)) { Text(t("حوّل", "Convert")) }
   if (busy) { if (pr < 0f) LinearProgressIndicator(Modifier.fillMaxWidth(), color = ac) else LinearProgressIndicator(progress = { pr }, Modifier.fillMaxWidth(), color = ac) }
