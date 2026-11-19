@@ -94,7 +94,10 @@ fun App() {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
               Circle("↑", t("إرسال", "Send"), ac) { items = listOf(); status = ""; screen = "pick" }
               Circle("↓", t("استقبال", "Receive"), ac) { status = ""; screen = "scan" }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
               Circle("♫", t("الصوت", "Audio"), ac) { status = ""; screen = "tools" }
+              Circle("⇩", t("التنزيل", "Download"), ac) { status = ""; screen = "download" }
             }
             Spacer(Modifier.height(30.dp))
             if (status.isNotEmpty()) Text(status)
@@ -108,6 +111,7 @@ fun App() {
           if (screen == "pick") PickScreen(Modifier.weight(1f), items, { items = it }, { m -> pick.launch(m) }, { folderPick.launch(null) }, apps, pm, ac, ar) {
             perm.launch(if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES) else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
           }
+          if (screen == "download") DownloadScreen(ac, ar)
           if (screen == "tools") ToolsScreen(ac, ar)
           if (screen == "scan") ScanScreen(Modifier.weight(1f), ar, ac, { stopAll(ctx); screen = "home" }) { onScan(it) }
           if (screen == "send") SendPanel(ac, ar, status, img, payload?.let { JSONObject(it).optString("s") } ?: "", fast, { fast = it; fastMode = it; fastLock(ctx, it) }, { tick++ })
