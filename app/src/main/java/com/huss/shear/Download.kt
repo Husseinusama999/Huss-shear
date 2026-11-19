@@ -58,6 +58,37 @@ fun rank(q: String, kind: Int, list: List<Res>): List<Res> {
   return list.sortedByDescending { it.score }
 }
 
+fun iaId(u: String) = u.substringAfter("/details/").substringBefore('/').substringBefore('?')
+
+fun stripTags(x: String) = android.text.Html.fromHtml(x, android.text.Html.FROM_HTML_MODE_LEGACY).toString().trim()
+
+/** General web search: Google Programmable Search if the user saved a key, otherwise DuckDuckGo (no key needed). */
+fun searchWeb(q: String): List<Res> {
+  val p = appCtx.getSharedPreferences("huss", 0)
+  val gk = p.getString("gkey", "") ?: ""; val gx = p.getString("gcx", "") ?: ""
+  val links = ArrayList<Triple<String, String, String?>>()
+  if (gk.isNotBlank() && gx.isNotBlank()) {
+    val items = JSONObject(httpGet("https://www.googleapis.com/customsearch/v1?key=" + Uri.encode(gk) + "&cx=" + Uri.encode(gx) + "&num=10&q=" + Uri.encode(q))).optJSONArray("items")
+    if (items != null) for (i in 0 until items.length()) {
+      val o = items.getJSONObject(i)
+      links.add(Triple(o.optString("title"), o.getString("link"), o.optJSONObject("pagemap")?.optJSONArray("cse_thumbnail")?.optJSONObject(0)?.optString("src")))
+    }
+  } else {
+    val page = httpGet("https://html.duckduckgo.com/html/?q=" + Uri.encode(q))
+    Regex("class=\"result__a\" href=\"([^\"]+)\"[^>]*>(.*?)</a>", RegexOption.DOT_MATCHES_ALL).findAll(page).take(12).forEach { m ->
+      val href = m.groupValues[1].replace("&amp;", "&")
+      val u = Uri.parse(if (href.startsWith("//")) "https:$href" else href).getQueryParameter("uddg") ?: href
+      links.add(Triple(stripTags(m.groupValues[2]), u, null))
+    }
+  }
+  return links.map { (title, u, th) ->
+    val host = try { URL(u).host.removePrefix("www.") } catch (e: Exception) { "" }
+    if (u.contains("archive.org/details/")) Res("ia", title, host, 0, 0, u, "https://archive.org/services/img/" + iaId(u))
+    else if (isYt(u)) Res("yt", title, host, 0, 0, u, th)
+    else Res("web", title, host, 0, 0, u, th)
+  }
+}
+
 fun searchAll(q: String, kind: Int): List<Res> {
   val out = ArrayList<Res>()
   try {
@@ -75,6 +106,7 @@ fun searchAll(q: String, kind: Int): List<Res> {
       out.add(Res("ia", d.optString("title", id), d.optString("creator", ""), 0, 0, "https://archive.org/details/$id", "https://archive.org/services/img/$id"))
     }
   } catch (e: Throwable) {}
+  try { out.addAll(searchWeb(q).filter { w -> out.none { it.url == w.url } }) } catch (e: Throwable) {}
   return rank(q, kind, out)
 }
 
@@ -89,18 +121,21 @@ fun iaPick(files: JSONArray): Pair<String?, String?> {
   return v?.optString("name") to a?.optString("name")
 }
 
-fun iaJob(r: Res, vn: String?, an: String?, mp3: Boolean, br: Int, dir: File, onP: (Float) -> Unit, done: (String) -> Unit) {
+fun iaJob(r: Res, vn: String?, an: String?, mp3: Boolean, br: Int, dir: File, onP: (Float) -> Unit, done0: (String) -> Unit) {
+  val job = Jobs.start(r.title)
+  val done: (String) -> Unit = { job.finish(it.startsWith("✓"), it); done0(it) }
   Thread {
     try {
-      val id = r.url.substringAfterLast('/'); val base = "https://archive.org/download/$id/"
+      val id = iaId(r.url); val base = "https://archive.org/download/$id/"
       val title = r.title.replace(Regex("[\\\\/:*?\"<>|%]"), "_").take(80)
       val out: File
-      if (mp3 && an != null) { out = File(dir, "$title.mp3"); fetchFile(base + Uri.encode(an, "/"), out) { onP(it * 100f) } }
+      if (mp3 && an != null) { out = File(dir, "$title.mp3"); fetchFile(base + Uri.encode(an, "/"), out, { d, tt -> job.bytes(d, tt) }) { onP(it * 100f) } }
       else if (vn != null) {
-        val v = File(dir, "v.bin"); fetchFile(base + Uri.encode(vn, "/"), v) { onP(it * (if (mp3) 80f else 100f)) }
+        val v = File(dir, "v.bin"); fetchFile(base + Uri.encode(vn, "/"), v, { d, tt -> job.bytes(d, tt) }) { onP(it * (if (mp3) 80f else 100f)) }
         if (mp3) {
           out = File(dir, "$title.mp3")
-          val x = runFfmpeg(listOf("-y", "-i", v.absolutePath, "-vn", "-c:a", "libmp3lame", "-b:a", "${br}k", out.absolutePath))
+          job.percent(-1f, "Converting / تحويل")
+          val x = runFfmpeg(listOf("-y", "-i", v.absolutePath, "-vn", "-c:a", "libmp3lame", "-b:a", "${br}k", out.absolutePath), job)
           if (x.first != 0) throw Exception(x.second.takeLast(300))
         } else { out = File(dir, "$title.mp4"); v.renameTo(out) }
       } else throw Exception("no file")
@@ -137,13 +172,17 @@ fun DownloadScreen(ac: Color, ar: Boolean) {
   var busy by remember { mutableStateOf(false) }
   var iaV by remember { mutableStateOf<String?>(null) }
   var iaA by remember { mutableStateOf<String?>(null) }
+  var showCfg by remember { mutableStateOf(false) }
+  val prefs = remember { c.getSharedPreferences("huss", 0) }
+  var gk by remember { mutableStateOf(prefs.getString("gkey", "") ?: "") }
+  var gx by remember { mutableStateOf(prefs.getString("gcx", "") ?: "") }
 
   fun pick(r: Res) {
     cur = r; heights = listOf(); h = 0; iaV = null; iaA = null; busy = true; st = t("بجلب الخيارات…", "Loading options…")
     Thread {
       try {
         if (r.src == "ia") {
-          val p = iaPick(JSONObject(httpGet("https://archive.org/metadata/" + r.url.substringAfterLast('/'))).getJSONArray("files"))
+          val p = iaPick(JSONObject(httpGet("https://archive.org/metadata/" + iaId(r.url))).getJSONArray("files"))
           iaV = p.first; iaA = p.second; mp3 = iaV == null
         } else if (isYt(r.url)) {
           val i = StreamInfo.getInfo(r.url); ytInfo = i; heights = ytHeights(i); if (heights.isNotEmpty()) h = heights.first()
@@ -153,7 +192,10 @@ fun DownloadScreen(ac: Color, ar: Boolean) {
           if (heights.isNotEmpty()) h = heights.first()
         }
         st = ""
-      } catch (e: Throwable) { st = "✗ ${e.message}" }
+      } catch (e: Throwable) {
+        val m = e.message ?: ""
+        st = if (m.contains("Unsupported URL") || m.contains("No video")) t("مفيش فيديو قابل للتنزيل في الصفحة دي بالمحرك الحالي", "No downloadable video found on this page with the current engine") else "✗ $m"
+      }
       busy = false
     }.start()
   }
@@ -168,6 +210,12 @@ fun DownloadScreen(ac: Color, ar: Boolean) {
     if (s.startsWith("http")) pick(Res("link", s, "", 0, 0, s, null))
     else { busy = true; cur = null; res = listOf(); st = t("بيدور…", "Searching…"); Thread { try { res = searchAll(s, kind); st = if (res.isEmpty()) t("مفيش نتايج", "No results") else "" } catch (e: Throwable) { st = "✗ ${e.message}" }; busy = false }.start() }
   }, Modifier.fillMaxWidth(), enabled = q.isNotBlank() && !busy) { Text(t("ابحث", "Search")) }
+  TextButton({ showCfg = !showCfg }) { Text("⚙ " + t("بحث جوجل (اختياري)", "Google search (optional)")) }
+  if (showCfg) {
+    OutlinedTextField(gk, { gk = it; prefs.edit().putString("gkey", it).apply() }, Modifier.fillMaxWidth(), label = { Text("Google API key") }, singleLine = true)
+    OutlinedTextField(gx, { gx = it; prefs.edit().putString("gcx", it).apply() }, Modifier.fillMaxWidth(), label = { Text("Search engine ID (cx)") }, singleLine = true)
+    Text(t("من غير المفاتيح دي البحث بيشتغل بمحرك DuckDuckGo. جوجل محتاج مفتاح مجاني من Programmable Search Engine (100 بحث في اليوم).", "Without these keys, web search uses DuckDuckGo. Google needs a free Programmable Search Engine key (100 searches/day)."), fontSize = 11.sp)
+  }
   if (st.isNotEmpty()) Text(st)
   if (cur == null) res.forEachIndexed { i, r ->
     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).clickable { pick(r) }.padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -176,7 +224,7 @@ fun DownloadScreen(ac: Color, ar: Boolean) {
       Column(Modifier.weight(1f)) {
         if (i == 0) Text("⭐ " + t("الأفضل", "Best match"), color = ac, fontSize = 12.sp, fontWeight = FontWeight.Bold)
         Text(r.title, maxLines = 2, fontSize = 14.sp)
-        Text(listOf(r.by, fmtDur(r.dur), if (r.src == "ia") t("Internet Archive (مجاني)", "Internet Archive (free)") else "YouTube").filter { it.isNotEmpty() }.joinToString(" • "), fontSize = 11.sp, maxLines = 1)
+        Text(listOf(r.by, fmtDur(r.dur), when (r.src) { "ia" -> t("Internet Archive (مجاني)", "Internet Archive (free)"); "web" -> t("ويب", "Web"); else -> "YouTube" }).filter { it.isNotEmpty() }.joinToString(" • "), fontSize = 11.sp, maxLines = 1)
       }
     }
   }
@@ -203,5 +251,5 @@ fun DownloadScreen(ac: Color, ar: Boolean) {
     }, Modifier.fillMaxWidth(), enabled = !busy) { Text(t("نزّل", "Download")) }
     if (busy) LinearProgressIndicator(progress = { pr }, Modifier.fillMaxWidth(), color = ac)
   }
-  Text(t("نزّل المحتوى اللي ليك حق فيه بس. الترتيب الذكي هنا قواعد ترتيب مش نموذج ذكاء اصطناعي.", "Only download content you have the rights to. The smart ranking here is rule-based, not an AI model."), fontSize = 11.sp)
+  Text(t("النتايج من يوتيوب وInternet Archive وبحث الويب، من غير فلترة. التنزيل بيشتغل بس لو الصفحة فيها فيديو أو صوت المحرك بيفهمه. نزّل اللي ليك حق فيه بس. الترتيب هنا قواعد مش ذكاء اصطناعي.", "Results come from YouTube, Internet Archive and web search, unfiltered. Download only works when the page has video or audio the engine understands. Only download what you have rights to. Ranking is rule-based, not AI."), fontSize = 11.sp)
 }
