@@ -228,45 +228,7 @@ fun ToolsScreen(ac: Color, ar: Boolean) {
   val ok = engine == "ok" && !busy
   fun tmp() = File(c.cacheDir, "dl" + System.currentTimeMillis()).also { it.mkdirs() }
   fun finish(m: String) { st = m; busy = false }
-  Text(t("تنزيل من رابط", "Download from link"), fontSize = 18.sp, fontWeight = FontWeight.Bold)
   if (engine != "ok") Text((if (engine == "loading") t("جاري تجهيز المحرك…", "Preparing engine…") else engine), fontSize = 12.sp)
-  OutlinedTextField(url, { url = it }, Modifier.fillMaxWidth(), label = { Text(t("رابط فيديو أو ملف صوت", "Video or audio link")) }, singleLine = true)
-  Button({
-    busy = true; st = "…"; ytInfo = null
-    Thread {
-      try {
-        if (isYt(url)) { val i = StreamInfo.getInfo(url.trim()); ytInfo = i; heights = ytHeights(i); finish(i.name) }
-        else {
-          val i = YoutubeDL.getInstance().getInfo(url.trim())
-          heights = (i.formats ?: arrayListOf()).filter { (it.vcodec ?: "none") != "none" && it.height > 0 }.map { it.height }.distinct().sortedDescending()
-          finish(i.title ?: "")
-        }
-        if (heights.isNotEmpty()) h = heights.first()
-      } catch (e: Throwable) { finish("✗ ${e.message}") }
-    }.start()
-  }, enabled = (ok || (!busy && isYt(url))) && url.isNotBlank()) { Text(t("جلب الجودات", "Fetch qualities")) }
-  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { Opt("MP3", kind == "MP3") { kind = "MP3" }; Opt("MP4", kind == "MP4") { kind = "MP4" } }
-  if (kind == "MP3") {
-    Text(t("جودة الصوت (kbps)", "Audio quality (kbps)"))
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf(128, 192, 256, 320).forEach { b -> Opt("$b", br == b) { br = b } } }
-  } else {
-    Text(t("جودة الفيديو", "Video quality"))
-    if (heights.isEmpty()) Text(t("اضغط «جلب الجودات» الأول", "Tap “Fetch qualities” first"), fontSize = 12.sp)
-    else Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) { heights.forEach { x -> Opt("${x}p", h == x) { h = x } } }
-  }
-  Button({
-    busy = true; pr = 0f; st = "…"
-    val dir = tmp()
-    val yi = ytInfo
-    if (isYt(url)) {
-      if (yi != null) ytJob(yi, kind == "MP3", h, br, dir, { pr = it / 100f }) { finish(it) }
-      else Thread {
-        try { val i = StreamInfo.getInfo(url.trim()); ytInfo = i; ytJob(i, kind == "MP3", h, br, dir, { pr = it / 100f }) { finish(it) } }
-        catch (e: Throwable) { finish("✗ NewPipe: ${e.message}"); dir.deleteRecursively() }
-      }.start()
-    } else linkJob(url.trim(), if (kind == "MP3") "MP3" else if (h > 0) "${h}p" else "best", br, dir, { pr = it / 100f }) { finish(it) }
-  }, Modifier.fillMaxWidth(), enabled = (ok || (!busy && isYt(url))) && url.isNotBlank()) { Text(t("نزّل", "Download")) }
-  HorizontalDivider()
   Text(t("تحويل ملف لصوت", "Convert a file to audio"), fontSize = 18.sp, fontWeight = FontWeight.Bold)
   OutlinedButton({ pickF.launch(arrayOf("video/*", "audio/*")) }) { Text(if (fileName.isEmpty()) t("اختار فيديو أو أغنية", "Pick a video or song") else fileName) }
   Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { Opt("MP3", fmt == "mp3") { fmt = "mp3" }; Opt("M4A", fmt == "m4a") { fmt = "m4a" } }
