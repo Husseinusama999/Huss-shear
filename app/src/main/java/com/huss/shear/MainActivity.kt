@@ -28,7 +28,7 @@ import androidx.compose.ui.unit.sp
 import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
-  override fun onCreate(b: Bundle?) { super.onCreate(b); appCtx = applicationContext; initEngine(application); setContent { App() } }
+  override fun onCreate(b: Bundle?) { super.onCreate(b); appCtx = applicationContext; setupChannels(this); initEngine(application); setContent { App() } }
 }
 
 @Composable
@@ -71,6 +71,10 @@ fun App() {
   LaunchedEffect(peerName) { if (peerName != null && (screen == "send" || screen == "recv")) screen = "portal" }
   BackHandler(enabled = screen != "home") {
     if (screen == "add") { items = listOf(); screen = "portal" } else { stopAll(ctx); items = listOf(); payload = null; screen = "home" }
+  }
+  val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+  LaunchedEffect(Unit) {
+    if (Build.VERSION.SDK_INT >= 33 && ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
   }
   val pm = ctx.packageManager
   val apps = remember {
