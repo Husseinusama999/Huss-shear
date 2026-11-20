@@ -17,6 +17,7 @@ dependencies {
   implementation("com.github.teamnewpipe:NewPipeExtractor:v0.27.1")
   implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
   implementation("org.apache.commons:commons-compress:1.27.1")
+  implementation("androidx.media3:media3-exoplayer:1.4.1")
   coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.0.4")
   implementation("io.github.junkfood02.youtubedl-android:library:0.16.0")
   implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.16.0")
