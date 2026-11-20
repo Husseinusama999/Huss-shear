@@ -1,5 +1,9 @@
 package com.huss.shear
 import android.graphics.BitmapFactory
+import android.widget.MediaController
+import android.widget.VideoView
+import androidx.compose.ui.viewinterop.AndroidView
+import org.schabi.newpipe.extractor.stream.DeliveryMethod
 import android.net.Uri
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
@@ -145,6 +149,37 @@ fun iaJob(r: Res, vn: String?, an: String?, mp3: Boolean, br: Int, dir: File, on
   }.start()
 }
 
+fun previewUrl(r: Res): String? {
+  if (r.src == "ia") {
+    val id = r.url.substringAfterLast('/')
+    val p = iaPick(JSONObject(httpGet("https://archive.org/metadata/$id")).getJSONArray("files"))
+    val n = p.first ?: p.second ?: return null
+    return "https://archive.org/download/$id/" + Uri.encode(n, "/")
+  }
+  if (isYt(r.url)) {
+    val i = StreamInfo.getInfo(r.url)
+    val combined = i.videoStreams.filter { it.isUrl && it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP && it.height > 0 }.sortedBy { it.height }
+    val v = combined.firstOrNull { it.height >= 240 } ?: combined.firstOrNull()
+    return v?.content ?: ytAudio(i)?.content
+  }
+  return null
+}
+
+@Composable
+fun PreviewPlayer(url: String, startFrac: Float, mod: Modifier, onErr: () -> Unit) {
+  val ctx = LocalContext.current
+  val vv = remember(url) { VideoView(ctx) }
+  DisposableEffect(vv) { onDispose { try { vv.stopPlayback() } catch (e: Exception) {} } }
+  AndroidView(factory = {
+    vv.apply {
+      val mc = MediaController(ctx); mc.setAnchorView(this); setMediaController(mc)
+      setVideoURI(Uri.parse(url), mapOf("User-Agent" to UA))
+      setOnPreparedListener { mp -> if (startFrac > 0f && mp.duration > 600000) seekTo((mp.duration * startFrac).toInt()); start() }
+      setOnErrorListener { _, _, _ -> onErr(); true }
+    }
+  }, modifier = mod)
+}
+
 fun fmtDur(s: Long) = if (s <= 0) "" else "%d:%02d".format(s / 60, s % 60)
 
 @Composable
@@ -172,6 +207,22 @@ fun DownloadScreen(ac: Color, ar: Boolean) {
   var busy by remember { mutableStateOf(false) }
   var iaV by remember { mutableStateOf<String?>(null) }
   var iaA by remember { mutableStateOf<String?>(null) }
+  var prevUrl by remember { mutableStateOf<String?>(null) }
+  var prevTitle by remember { mutableStateOf("") }
+  var prevFrac by remember { mutableFloatStateOf(0f) }
+  var prevBusy by remember { mutableStateOf(false) }
+
+  fun preview(r: Res) {
+    prevUrl = null; prevBusy = true; prevTitle = r.title
+    Thread {
+      try {
+        val u = previewUrl(r)
+        if (u == null) st = t("المعاينة مش متاحة للرابط ده", "Preview not available for this link")
+        else { prevFrac = if (r.dur > 600 || kind == 2) 0.15f else 0f; prevUrl = u }
+      } catch (e: Throwable) { st = "✗ ${e.message}" }
+      prevBusy = false
+    }.start()
+  }
   var showCfg by remember { mutableStateOf(false) }
   val prefs = remember { c.getSharedPreferences("huss", 0) }
   var gk by remember { mutableStateOf(prefs.getString("gkey", "") ?: "") }
@@ -217,6 +268,13 @@ fun DownloadScreen(ac: Color, ar: Boolean) {
     Text(t("من غير المفاتيح دي البحث بيشتغل بمحرك DuckDuckGo. جوجل محتاج مفتاح مجاني من Programmable Search Engine (100 بحث في اليوم).", "Without these keys, web search uses DuckDuckGo. Google needs a free Programmable Search Engine key (100 searches/day)."), fontSize = 11.sp)
   }
   if (st.isNotEmpty()) Text(st)
+  if (prevBusy) Text(t("بجهّز المعاينة…", "Preparing preview…"), fontSize = 12.sp)
+  val pu = prevUrl
+  if (pu != null) {
+    Text(prevTitle, fontWeight = FontWeight.Bold, maxLines = 1)
+    PreviewPlayer(pu, prevFrac, Modifier.fillMaxWidth().height(220.dp).clip(RoundedCornerShape(12.dp))) { st = t("المعاينة مش متاحة", "Preview unavailable") }
+    OutlinedButton({ prevUrl = null }) { Text(t("إغلاق المعاينة", "Close preview")) }
+  }
   if (cur == null) res.forEachIndexed { i, r ->
     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).clickable { pick(r) }.padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
       RemoteThumb(r.thumb, Modifier.size(width = 96.dp, height = 60.dp).clip(RoundedCornerShape(10.dp)))
@@ -226,12 +284,16 @@ fun DownloadScreen(ac: Color, ar: Boolean) {
         Text(r.title, maxLines = 2, fontSize = 14.sp)
         Text(listOf(r.by, fmtDur(r.dur), when (r.src) { "ia" -> t("Internet Archive (مجاني)", "Internet Archive (free)"); "web" -> t("ويب", "Web"); else -> "YouTube" }).filter { it.isNotEmpty() }.joinToString(" • "), fontSize = 11.sp, maxLines = 1)
       }
+      Text("▶", Modifier.clickable { preview(r) }.padding(12.dp), fontSize = 22.sp, color = ac)
     }
   }
   val r = cur
   if (r != null) {
     Text(r.title, fontWeight = FontWeight.Bold, maxLines = 2)
-    OutlinedButton({ cur = null; st = "" }) { Text(t("رجوع للنتائج", "Back to results")) }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+      OutlinedButton({ cur = null; st = "" }) { Text(t("رجوع للنتائج", "Back to results")) }
+      OutlinedButton({ preview(r) }) { Text("▶ " + t("معاينة", "Preview")) }
+    }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { Opt(t("صوت MP3", "Audio MP3"), mp3) { mp3 = true }; Opt(t("فيديو MP4", "Video MP4"), !mp3) { mp3 = false } }
     if (mp3) {
       if (r.src == "ia") Text(t("بتتنزل بجودتها الأصلية", "Downloads in original quality"), fontSize = 12.sp)
