@@ -1,7 +1,19 @@
 package com.huss.shear
 import android.graphics.BitmapFactory
-import android.widget.MediaController
-import android.widget.VideoView
+import android.view.TextureView
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import kotlinx.coroutines.delay
+import org.schabi.newpipe.extractor.MediaFormat
+import org.schabi.newpipe.extractor.stream.VideoStream
 import androidx.compose.ui.viewinterop.AndroidView
 import org.schabi.newpipe.extractor.stream.DeliveryMethod
 import android.net.Uri
@@ -149,35 +161,67 @@ fun iaJob(r: Res, vn: String?, an: String?, mp3: Boolean, br: Int, dir: File, on
   }.start()
 }
 
-fun previewUrl(r: Res): String? {
+class PrevSrc(val video: String?, val audio: String?)
+
+fun previewUrl(r: Res): PrevSrc? {
   if (r.src == "ia") {
     val id = r.url.substringAfterLast('/')
     val p = iaPick(JSONObject(httpGet("https://archive.org/metadata/$id")).getJSONArray("files"))
     val n = p.first ?: p.second ?: return null
-    return "https://archive.org/download/$id/" + Uri.encode(n, "/")
+    return PrevSrc("https://archive.org/download/$id/" + Uri.encode(n, "/"), null)
   }
   if (isYt(r.url)) {
     val i = StreamInfo.getInfo(r.url)
-    val combined = i.videoStreams.filter { it.isUrl && it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP && it.height > 0 }.sortedBy { it.height }
-    val v = combined.firstOrNull { it.height >= 240 } ?: combined.firstOrNull()
-    return v?.content ?: ytAudio(i)?.content
+    val all = ytStreams(i)
+    val comb = all.filter { !it.isVideoOnly }.sortedBy { it.height }
+    val c1 = comb.firstOrNull { it.height >= 240 } ?: comb.firstOrNull()
+    if (c1 != null) return PrevSrc(c1.content, null)
+    val vo = all.filter { it.isVideoOnly }.sortedWith(compareBy<VideoStream> { if (it.height >= 240) 0 else 1 }.thenBy { it.height }.thenByDescending { if (it.format == MediaFormat.MPEG_4) 1 else 0 })
+    val v = vo.firstOrNull(); val a = ytAudio(i)?.content
+    return if (v != null) PrevSrc(v.content, a) else if (a != null) PrevSrc(null, a) else null
   }
   return null
 }
 
+@OptIn(UnstableApi::class)
 @Composable
-fun PreviewPlayer(url: String, startFrac: Float, mod: Modifier, onErr: () -> Unit) {
+fun PreviewPlayer(src: PrevSrc, startFrac: Float, ac: Color, onErr: () -> Unit) {
   val ctx = LocalContext.current
-  val vv = remember(url) { VideoView(ctx) }
-  DisposableEffect(vv) { onDispose { try { vv.stopPlayback() } catch (e: Exception) {} } }
-  AndroidView(factory = {
-    vv.apply {
-      val mc = MediaController(ctx); mc.setAnchorView(this); setMediaController(mc)
-      setVideoURI(Uri.parse(url), mapOf("User-Agent" to UA))
-      setOnPreparedListener { mp -> if (startFrac > 0f && mp.duration > 600000) seekTo((mp.duration * startFrac).toInt()); start() }
-      setOnErrorListener { _, _, _ -> onErr(); true }
+  val player = remember(src) { ExoPlayer.Builder(ctx).build() }
+  val tv = remember(src) { TextureView(ctx) }
+  var ratio by remember { mutableFloatStateOf(16f / 9f) }
+  var pos by remember { mutableLongStateOf(0L) }
+  var dur by remember { mutableLongStateOf(0L) }
+  var playing by remember { mutableStateOf(true) }
+  DisposableEffect(player) {
+    var seeked = false
+    val http = DefaultHttpDataSource.Factory().setUserAgent(UA).setAllowCrossProtocolRedirects(true)
+    val pf = ProgressiveMediaSource.Factory(http)
+    val vUrl = src.video; val aUrl = src.audio
+    val ms: MediaSource = if (vUrl != null && aUrl != null) MergingMediaSource(pf.createMediaSource(MediaItem.fromUri(vUrl)), pf.createMediaSource(MediaItem.fromUri(aUrl)))
+      else pf.createMediaSource(MediaItem.fromUri((vUrl ?: aUrl)!!))
+    val l = object : Player.Listener {
+      override fun onVideoSizeChanged(v: VideoSize) { if (v.width > 0 && v.height > 0) ratio = v.width * v.pixelWidthHeightRatio / v.height }
+      override fun onPlayerError(e: PlaybackException) { onErr() }
+      override fun onIsPlayingChanged(p: Boolean) { playing = p }
+      override fun onPlaybackStateChanged(s: Int) {
+        if (s == Player.STATE_READY && !seeked) { seeked = true; if (startFrac > 0f && player.duration > 600000) player.seekTo((player.duration * startFrac).toLong()) }
+      }
     }
-  }, modifier = mod)
+    player.addListener(l); player.setVideoTextureView(tv)
+    player.setMediaSource(ms); player.prepare(); player.playWhenReady = true
+    onDispose { player.release() }
+  }
+  LaunchedEffect(player) { while (true) { pos = player.currentPosition; dur = maxOf(0L, player.duration); delay(500) } }
+  fun tm(ms: Long) = "%d:%02d".format(ms / 60000, (ms / 1000) % 60)
+  Column {
+    if (src.video != null) AndroidView({ tv }, Modifier.fillMaxWidth().aspectRatio(ratio).background(Color.Black))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+      Text(if (playing) "⏸" else "▶", Modifier.clickable { if (player.isPlaying) player.pause() else player.play() }.padding(10.dp), fontSize = 22.sp, color = ac)
+      Slider(if (dur > 0) (pos.toFloat() / dur).coerceIn(0f, 1f) else 0f, { if (dur > 0) pos = (it * dur).toLong() }, Modifier.weight(1f), onValueChangeFinished = { player.seekTo(pos) })
+      Text(tm(pos) + "/" + tm(dur), fontSize = 11.sp)
+    }
+  }
 }
 
 fun fmtDur(s: Long) = if (s <= 0) "" else "%d:%02d".format(s / 60, s % 60)
@@ -207,18 +251,18 @@ fun DownloadScreen(ac: Color, ar: Boolean) {
   var busy by remember { mutableStateOf(false) }
   var iaV by remember { mutableStateOf<String?>(null) }
   var iaA by remember { mutableStateOf<String?>(null) }
-  var prevUrl by remember { mutableStateOf<String?>(null) }
+  var prevSrc by remember { mutableStateOf<PrevSrc?>(null) }
   var prevTitle by remember { mutableStateOf("") }
   var prevFrac by remember { mutableFloatStateOf(0f) }
   var prevBusy by remember { mutableStateOf(false) }
 
   fun preview(r: Res) {
-    prevUrl = null; prevBusy = true; prevTitle = r.title
+    prevSrc = null; prevBusy = true; prevTitle = r.title
     Thread {
       try {
         val u = previewUrl(r)
         if (u == null) st = t("المعاينة مش متاحة للرابط ده", "Preview not available for this link")
-        else { prevFrac = if (r.dur > 600 || kind == 2) 0.15f else 0f; prevUrl = u }
+        else { prevFrac = if (r.dur > 600 || kind == 2) 0.15f else 0f; prevSrc = u }
       } catch (e: Throwable) { st = "✗ ${e.message}" }
       prevBusy = false
     }.start()
@@ -269,11 +313,11 @@ fun DownloadScreen(ac: Color, ar: Boolean) {
   }
   if (st.isNotEmpty()) Text(st)
   if (prevBusy) Text(t("بجهّز المعاينة…", "Preparing preview…"), fontSize = 12.sp)
-  val pu = prevUrl
+  val pu = prevSrc
   if (pu != null) {
     Text(prevTitle, fontWeight = FontWeight.Bold, maxLines = 1)
-    PreviewPlayer(pu, prevFrac, Modifier.fillMaxWidth().height(220.dp).clip(RoundedCornerShape(12.dp))) { st = t("المعاينة مش متاحة", "Preview unavailable") }
-    OutlinedButton({ prevUrl = null }) { Text(t("إغلاق المعاينة", "Close preview")) }
+    PreviewPlayer(pu, prevFrac, ac) { st = t("المعاينة مش متاحة", "Preview unavailable") }
+    OutlinedButton({ prevSrc = null }) { Text(t("إغلاق المعاينة", "Close preview")) }
   }
   if (cur == null) res.forEachIndexed { i, r ->
     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).clickable { pick(r) }.padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
